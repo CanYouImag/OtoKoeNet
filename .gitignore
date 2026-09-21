@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# IDE
+.idea/
+
+# 大体积数据 / 生成物（不入库，部署时重新生成）
+data/
+runs/
+log/
+
+# 版权资料（勿上传）
+参考论文/
+参考文献/
+
+# 环境变量 / 密钥
+.env
+
+# 系统文件
+.DS_Store
+Thumbs.db
+desktop.ini

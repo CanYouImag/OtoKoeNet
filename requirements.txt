@@ -1,0 +1,10 @@
+torch==2.13.0+cpu
+torchaudio==2.11.0+cpu
+numpy==2.5.1
+tqdm==4.70.0
+pyyaml==6.0.3
+pykakasi==2.3.0
+soundfile==0.14.0
+jaconv==0.5.0
+sudachipy==0.6.11
+sudachidict_core==20260723
