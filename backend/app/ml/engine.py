@@ -5,7 +5,7 @@ import torch
 
 from otokoenet.align import forced_align, score_alignment
 from otokoenet.data import Manifest, apply_cmvn, extract_fbank, load_wav
-from otokoenet.decode import build_lexicon, ctc_collapse, nearest_top2
+from otokoenet.decode import NGramLM, build_lexicon, ctc_collapse, ctc_prefix_beam_search, nearest_top2
 from otokoenet.kana2kanji import Kana2Kanji
 from otokoenet.model import DualCTC
 from otokoenet.text import Vocab
@@ -51,6 +51,10 @@ class Engine:
         )
         table_path = cache / "kana2kanji.json"
         self.converter = Kana2Kanji(table_path) if table_path.exists() else None
+        self.lm: NGramLM | None = None
+        if settings.lm_weight > 0:
+            seqs = [e["mora_ids"] for e in Manifest.load(str(cache / "train.json")).entries]
+            self.lm = NGramLM(order=settings.lm_order).fit(seqs, vocab_size=len(self.mora_vocab))
 
     def featurize(self, wav_path: str) -> np.ndarray:
         wav = load_wav(wav_path, self.settings.sample_rate)
@@ -66,7 +70,16 @@ class Engine:
 
     def recognize(self, feat: np.ndarray) -> str:
         _, mora_logits = self._encode(feat)
-        mora_ids = ctc_collapse(mora_logits)
+        if self.settings.decoder == "beam":
+            mora_ids, _ = ctc_prefix_beam_search(
+                mora_logits.detach().numpy(),
+                beam_size=self.settings.beam_size,
+                lm=self.lm if self.settings.lm_weight > 0 else None,
+                lm_weight=self.settings.lm_weight,
+                length_penalty=self.settings.length_penalty,
+            )[0]
+        else:
+            mora_ids = ctc_collapse(mora_logits)
         char_ids, best_d, second_d = nearest_top2(mora_ids, self.lexicon)
         # 已知句判定：最近句明显胜出（margin>=1）且绝对距离不大
         if second_d - best_d >= 1 and best_d <= max(4, len(mora_ids) // 4):

@@ -10,7 +10,7 @@ import numpy as np
 import torch
 
 from otokoenet.data import Manifest, apply_cmvn, extract_fbank, load_wav
-from otokoenet.decode import build_lexicon, ctc_collapse, nearest_top2
+from otokoenet.decode import NGramLM, build_lexicon, ctc_collapse, ctc_prefix_beam_search, nearest_top2
 from otokoenet.kana2kanji import Kana2Kanji
 from otokoenet.model import DualCTC
 from otokoenet.text import Vocab
@@ -55,6 +55,11 @@ def recognize(
     lexicon: dict | None,
     converter: Kana2Kanji,
     audio_path: Path,
+    decoder: str = "beam",
+    beam_size: int = 12,
+    lm: NGramLM | None = None,
+    lm_weight: float = 1.0,
+    length_penalty: float = 0.0,
 ) -> tuple[str, bool, str]:
     wav = load_wav(str(audio_path), cfg["audio"]["sample_rate"])
     feat = extract_fbank(wav, cfg["audio"]["sample_rate"], cfg["audio"]["n_mels"]).numpy()
@@ -64,7 +69,16 @@ def recognize(
     char_logits, mora_logits, out_len = model(x, feat_len)
     if out_len[0].item() == 0:
         return "", False, ""
-    mora_ids = ctc_collapse(mora_logits[0, : out_len[0]])
+    if decoder == "greedy":
+        mora_ids = ctc_collapse(mora_logits[0, : out_len[0]])
+    else:
+        mora_ids, _ = ctc_prefix_beam_search(
+            mora_logits[0, : out_len[0]].detach().numpy(),
+            beam_size=beam_size,
+            lm=lm if lm_weight > 0 else None,
+            lm_weight=lm_weight,
+            length_penalty=length_penalty,
+        )[0]
     kana = "".join(mora_vocab.decode(mora_ids))
     if lexicon is not None:
         char_ids, best_d, second_d = nearest_top2(mora_ids, lexicon)
@@ -80,6 +94,11 @@ def main() -> None:
     ap.add_argument("--ckpt", type=str, default="runs/basic5000/best.pt")
     ap.add_argument("--table", type=str, default="data/cache/basic5000/kana2kanji.json")
     ap.add_argument("--no-lexicon", action="store_true", help="关闭句库最近邻，直接走假名→汉字转换")
+    ap.add_argument("--decoder", type=str, choices=["greedy", "beam"], default="beam")
+    ap.add_argument("--beam-size", type=int, default=12)
+    ap.add_argument("--lm-order", type=int, default=4)
+    ap.add_argument("--lm-weight", type=float, default=1.0)
+    ap.add_argument("--length-penalty", type=float, default=0.0)
     args = ap.parse_args()
 
     audio = Path(args.audio)
@@ -98,10 +117,22 @@ def main() -> None:
     if not args.no_lexicon:
         lexicon = build_lexicon(Manifest.load(str(cache / "train.json")))
     converter = Kana2Kanji(Path(args.table))
+    lm = None
+    if args.lm_weight > 0:
+        seqs = [e["mora_ids"] for e in Manifest.load(str(cache / "train.json")).entries]
+        lm = NGramLM(order=args.lm_order).fit(seqs, vocab_size=len(mora_vocab))
 
-    text, known, kana = recognize(model, cfg, char_vocab, mora_vocab, mean, std, lexicon, converter, audio)
+    text, known, kana = recognize(
+        model, cfg, char_vocab, mora_vocab, mean, std, lexicon, converter, audio,
+        decoder=args.decoder, beam_size=args.beam_size, lm=lm,
+        lm_weight=args.lm_weight, length_penalty=args.length_penalty,
+    )
     print(text)
-    print(f"[route] {'known' if known else 'open'}  kana={kana}", file=sys.stderr)
+    print(
+        f"[route] {'known' if known else 'open'}  decoder={args.decoder} "
+        f"beam={args.beam_size} lm_weight={args.lm_weight}  kana={kana}",
+        file=sys.stderr,
+    )
 
 
 if __name__ == "__main__":

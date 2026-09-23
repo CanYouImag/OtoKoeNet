@@ -25,6 +25,13 @@ class Settings:
     score_green: float = 0.75
     score_yellow: float = 0.45
 
+    # 解码配置（beam search + 语料 n-gram LM 浅层融合）
+    decoder: str = "beam"             # greedy | beam
+    beam_size: int = 12
+    lm_order: int = 4
+    lm_weight: float = 1.0
+    length_penalty: float = 0.0
+
 
 settings = Settings()
 settings.upload_dir.mkdir(parents=True, exist_ok=True)

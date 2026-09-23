@@ -10,10 +10,36 @@ import numpy as np
 import torch
 
 from otokoenet.data import Manifest, apply_cmvn
-from otokoenet.decode import build_lexicon, ctc_collapse, edit_distance, nearest_top2
+from otokoenet.decode import NGramLM, build_lexicon, ctc_collapse, ctc_prefix_beam_search, edit_distance, nearest_top2
 from otokoenet.kana2kanji import Kana2Kanji
 from otokoenet.model import DualCTC
 from otokoenet.text import Vocab
+
+
+def build_lm(train_manifest: Manifest, mora_vocab: Vocab, order: int) -> NGramLM:
+    seqs = [e["mora_ids"] for e in train_manifest.entries]
+    return NGramLM(order=order).fit(seqs, vocab_size=len(mora_vocab))
+
+
+def decode_mora(
+    mora_logits: np.ndarray,
+    *,
+    decoder: str,
+    beam_size: int,
+    lm: NGramLM | None,
+    lm_weight: float,
+    length_penalty: float,
+) -> list[int]:
+    if decoder == "greedy":
+        return ctc_collapse(mora_logits)
+    seq, _ = ctc_prefix_beam_search(
+        mora_logits,
+        beam_size=beam_size,
+        lm=lm if lm_weight > 0 else None,
+        lm_weight=lm_weight,
+        length_penalty=length_penalty,
+    )[0]
+    return seq
 
 
 def main() -> None:
@@ -21,6 +47,11 @@ def main() -> None:
     ap.add_argument("--cache-dir", type=str, default="data/cache/basic5000")
     ap.add_argument("--ckpt", type=str, default="runs/basic5000/best.pt")
     ap.add_argument("--table", type=str, default="data/cache/basic5000/kana2kanji.json")
+    ap.add_argument("--decoder", type=str, choices=["greedy", "beam"], default="beam")
+    ap.add_argument("--beam-size", type=int, default=12)
+    ap.add_argument("--lm-order", type=int, default=4)
+    ap.add_argument("--lm-weight", type=float, default=1.0)
+    ap.add_argument("--length-penalty", type=float, default=0.0)
     ap.add_argument("--num-examples", type=int, default=8)
     args = ap.parse_args()
 
@@ -59,6 +90,7 @@ def main() -> None:
     test_manifest = Manifest.load(str(cache / "test.json"))
     lexicon = build_lexicon(train_manifest, test_manifest)
     converter = Kana2Kanji(Path(args.table))
+    lm = build_lm(train_manifest, mora_vocab, args.lm_order)
 
     total_char = err = known_char = known_err = open_char = open_err = 0
     n_known = n_open = 0
@@ -70,7 +102,14 @@ def main() -> None:
         x = torch.from_numpy(feat).float().unsqueeze(0)
         feat_len = torch.tensor([feat.shape[0]], dtype=torch.long)
         char_logits, mora_logits, out_len = model(x, feat_len)
-        mora_ids = ctc_collapse(mora_logits[0, : out_len[0]])
+        mora_ids = decode_mora(
+            mora_logits[0, : out_len[0]].detach().numpy(),
+            decoder=args.decoder,
+            beam_size=args.beam_size,
+            lm=lm,
+            lm_weight=args.lm_weight,
+            length_penalty=args.length_penalty,
+        )
         char_ids, best_d, second_d = nearest_top2(mora_ids, lexicon)
         if second_d - best_d >= 1 and best_d <= max(4, len(mora_ids) // 4):
             return "".join(char_vocab.decode(char_ids)), True
@@ -97,6 +136,10 @@ def main() -> None:
     def pct(e, c):
         return f"{e / c * 100:.2f}%" if c else "-"
 
+    print(
+        f"decoder={args.decoder} beam={args.beam_size} lm_order={args.lm_order} "
+        f"lm_weight={args.lm_weight} length_penalty={args.length_penalty}"
+    )
     print(f"total : n={n_known + n_open} CER={pct(err, total_char)}")
     print(f"known : n={n_known} CER={pct(known_err, known_char)}")
     print(f"open  : n={n_open} CER={pct(open_err, open_char)}")
