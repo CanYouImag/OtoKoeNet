@@ -130,6 +130,11 @@ def main() -> None:
     ap.add_argument("--config", type=str, default="configs/basic5000.yaml")
     ap.add_argument("--resume", type=str, default=None)
     ap.add_argument(
+        "--fresh",
+        action="store_true",
+        help="忽略 save_dir 中已有的 last.pt，从零开始训练",
+    )
+    ap.add_argument(
         "--device",
         type=str,
         default="auto",
@@ -189,13 +194,19 @@ def main() -> None:
     specaug = SpecAugment() if tcfg.get("specaug", True) else None
 
     start_step = 0
-    if args.resume:
-        ckpt = torch.load(args.resume, map_location="cpu")
+    start_epoch = 1
+    ckpt_path = args.resume
+    if ckpt_path is None and not args.fresh and (save_dir / "last.pt").exists():
+        ckpt_path = str(save_dir / "last.pt")
+        print(f"auto-resume: 未指定 --resume，检测到已有断点 {ckpt_path}")
+    if ckpt_path:
+        ckpt = torch.load(ckpt_path, map_location="cpu")
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         ema.shadow = ckpt["ema"]
         start_step = ckpt["step"]
-        print(f"resumed from {args.resume} step={start_step}")
+        start_epoch = ckpt.get("epoch", 1)
+        print(f"resumed from {ckpt_path} step={start_step} epoch={start_epoch}")
 
     train_ds = CacheDataset(train_manifest)
     test_ds = CacheDataset(test_manifest)
@@ -230,8 +241,23 @@ def main() -> None:
     writer = csv.writer(log_f)
     if start_step == 0:
         writer.writerow(["step", "loss", "lr", "cer_ctc", "mer"])
+    ckpt_interval = max(1, tcfg.get("ckpt_interval", 500))
 
-    for epoch in range(1, tcfg["num_epochs"] + 1):
+    def save_ckpt(path: Path, epoch: int, step: int) -> None:
+        torch.save(
+            {
+                "model": model.state_dict(),
+                "ema": ema.shadow,
+                "optimizer": optimizer.state_dict(),
+                "step": step,
+                "epoch": epoch,
+                "config": cfg,
+            },
+            path,
+        )
+        print(f"  saved {path.name} step={step} epoch={epoch}", flush=True)
+
+    for epoch in range(start_epoch, tcfg["num_epochs"] + 1):
         model.train()
         epoch_loss = 0.0
         n_batch = 0
@@ -317,6 +343,8 @@ def main() -> None:
             ema.update()
             step += 1
             sched.step(step)
+            if step % ckpt_interval == 0:
+                save_ckpt(save_dir / "last.pt", epoch, step)
             epoch_loss += loss.item()
             n_batch += 1
             if step % tcfg["log_interval"] == 0:
@@ -341,28 +369,10 @@ def main() -> None:
 
         if metrics[track_metric] < best_val:
             best_val = metrics[track_metric]
-            torch.save(
-                {
-                    "model": model.state_dict(),
-                    "ema": ema.shadow,
-                    "optimizer": optimizer.state_dict(),
-                    "step": step,
-                    "config": cfg,
-                },
-                save_dir / "best.pt",
-            )
-            print(f"  saved best.pt {track_metric}={best_val*100:.2f}%")
+            save_ckpt(save_dir / "best.pt", epoch, step)
+            print(f"  best {track_metric}={best_val*100:.2f}%")
 
-        torch.save(
-            {
-                "model": model.state_dict(),
-                "ema": ema.shadow,
-                "optimizer": optimizer.state_dict(),
-                "step": step,
-                "config": cfg,
-            },
-            save_dir / "last.pt",
-        )
+        save_ckpt(save_dir / "last.pt", epoch, step)
     log_f.close()
     print("done")
 

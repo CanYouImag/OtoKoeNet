@@ -30,5 +30,6 @@ train:
   ctc_weight_mora: 0.5
   ema_decay: 0.999
   log_interval: 50
+  ckpt_interval: 500
   num_threads: 12
   save_dir: runs/basic5000_gate
