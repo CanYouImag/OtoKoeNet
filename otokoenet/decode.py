@@ -157,8 +157,11 @@ def ctc_prefix_beam_search(
     ]
 
 
-def ctc_collapse(logits: torch.Tensor) -> list[int]:
-    ids = logits.argmax(dim=-1).tolist()
+def ctc_collapse(logits) -> list[int]:
+    try:
+        ids = logits.argmax(dim=-1).tolist()
+    except TypeError:
+        ids = logits.argmax(-1).tolist()
     out: list[int] = []
     prev = -1
     for i in ids:

@@ -14,6 +14,9 @@ data/
 runs/
 log/
 
+# 本地备份快照（含 best.pt/last.pt 等模型产物）
+backup_*/
+
 # 版权资料（勿上传）
 参考论文/
 参考文献/

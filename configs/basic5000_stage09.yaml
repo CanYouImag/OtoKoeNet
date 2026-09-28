@@ -1,0 +1,51 @@
+# 阶段 9 起的干净基线（BN 修复后重训）
+#
+# 与 configs/basic5000_stage05a_e120.yaml 逐项对齐，只改两处：
+#   1) train.track_metric: cer_ctc -> mer
+#      5A 用 char CER（val ~32%，最差的头）挑 best.pt，而真正work的是 mora 头
+#      （MER 7.4%）。用最差的头做模型选择本身就是错的，这里改为 mora MER。
+#   2) train.save_dir: runs/basic5000_stage05a -> runs/basic5000_stage09
+#      不覆盖 5A 产物。5A 权重属于修复前 BN regime，只作历史参照。
+#
+# 数据用 stage 8 修正过 CMVN 的 basic5000_v2（max diff 1.252e-06）。
+# 预期耗时：CPU 12 线程约 8.5 小时（5A 实测 256s/epoch 中位）。
+data:
+  jsut_root: data/jsut_ver1.1
+  cache_dir: data/cache/basic5000_v2
+  val_size: 200
+  test_size: 200
+  split_seed: 42
+  seed: 0
+
+audio:
+  sample_rate: 16000
+  n_mels: 80
+
+model:
+  d_model: 128
+  n_layers: 6
+  n_heads: 4
+  ffn_dim: 512
+  conv_kernel: 7
+  dropout: 0.1
+  ctc_gate: false
+
+train:
+  batch_size: 8
+  num_epochs: 120
+  lr: 0.0001
+  warmup_steps: 1000
+  weight_decay: 0.01
+  grad_clip: 5.0
+  specaug: true
+  speed_perturb: false
+  ctc_weight_char: 1.0
+  ctc_weight_mora: 0.5
+  track_metric: mer
+  grad_analysis: false
+  ema_decay: 0.999
+  seed: 1234
+  log_interval: 50
+  ckpt_interval: 500
+  num_threads: 12
+  save_dir: runs/basic5000_stage09

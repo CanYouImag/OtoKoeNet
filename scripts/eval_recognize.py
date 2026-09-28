@@ -88,7 +88,7 @@ def main() -> None:
 
     train_manifest = Manifest.load(str(cache / "train.json"))
     test_manifest = Manifest.load(str(cache / "test.json"))
-    lexicon = build_lexicon(train_manifest, test_manifest)
+    lexicon = build_lexicon(train_manifest)
     converter = Kana2Kanji(Path(args.table))
     lm = build_lm(train_manifest, mora_vocab, args.lm_order)
 

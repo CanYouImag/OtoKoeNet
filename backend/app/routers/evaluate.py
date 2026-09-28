@@ -7,6 +7,8 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
 from sqlalchemy.orm import Session
 
+from otokoenet.align import AlignmentError
+
 from app.bank import text_to_mora
 from app.config import settings
 from app.deps import get_current_user, get_db
@@ -63,14 +65,40 @@ def evaluate(
     audio_path = _save_upload(file)
     t0 = time.perf_counter()
     feat = engine.featurize(audio_path)
-    scores, total = engine.evaluate(feat, mora_ids)
+    try:
+        aln = engine.evaluate_detailed(feat, mora_ids)
+    except AlignmentError as e:
+        db.commit()
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            {
+                "error": "align_failed",
+                "reason": e.reason,
+                "detail": e.detail,
+            },
+        ) from e
     duration = time.perf_counter() - t0
 
     details = [
-        MoraScore(phoneme=m, score=round(s * 100, 1), color=_color(s))
-        for m, s in zip(morae, scores)
+        MoraScore(
+            phoneme=m,
+            score=round(s * 100, 1),
+            color=_color(s),
+            index=i,
+            # start/end 是 Viterbi 路径上该 token 的帧区间。训到收敛的模型逐帧过度
+            # 自信，Viterbi 几乎只给每个 token 1 帧，所以这两个值只表示「最可能的那
+            # 几毫秒在哪」，宽度不携带时长信息。
+            start_ms=round(aln.spans[i][0] * aln.frame_ms, 1),
+            end_ms=round(aln.spans[i][1] * aln.frame_ms, 1),
+            # duration/rel_duration 走后验：Viterbi 时长恒等于 1 帧（实测 6781 个
+            # mora 实例标准差全为 0），拿去做前端展示毫无意义；后验时长才有区分度。
+            # 注意逐实例取的是该 token 自己的两个状态，重复 mora 不会重复计数。
+            duration_ms=round(aln.post_duration_ms(i), 1),
+            rel_duration=round(aln.post_rel_durations[i], 3),
+        )
+        for i, (m, s) in enumerate(zip(morae, aln.scores))
     ]
-    total_score = round(total * 100, 1)
+    total_score = round(aln.total * 100, 1)
 
     db.add(
         Record(

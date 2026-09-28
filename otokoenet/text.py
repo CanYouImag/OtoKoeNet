@@ -1,26 +1,37 @@
 from __future__ import annotations
 
 import json
+import unicodedata
 from dataclasses import dataclass
+
+import jaconv
 
 
 _STRIP_CHARS = set(
     "、。，．「」『』（）()【】・？！？!…—\"'‘’“”<>《》〈〉&;:／/\\"
 )
 
-_SMALL_Y = set("ャュョ")
-_SMALL_A = set("ァィゥェォ")
-_MORA_SPECIAL = ("ッ", "ン", "ー")
+_SMALL_Y = set("ャュョゃゅょ")
+_SMALL_A = set("ァィゥェォぁぃぅぇぉ")
+_MORA_SPECIAL = ("ッ", "っ", "ン", "ん", "ー")
 
 SOS = "<sos>"
 EOS = "<eos>"
+UNK = "<unk>"
 
 
 def normalize_text(text: str) -> str:
+    text = unicodedata.normalize("NFKC", text)
     return "".join(ch for ch in text if ch not in _STRIP_CHARS and not ch.isspace())
 
 
+def normalize_kana(text: str) -> str:
+    text = jaconv.kata2hira(unicodedata.normalize("NFKC", text))
+    return "".join(ch for ch in text if "ぁ" <= ch <= "ゖ" or ch == "ー")
+
+
 def kana_to_mora(kana: str) -> list[str]:
+    kana = normalize_kana(kana)
     morae: list[str] = []
     i, n = 0, len(kana)
     while i < n:
@@ -64,6 +75,10 @@ class Vocab:
     def eos_id(self) -> int:
         return self._sym2id[EOS]
 
+    @property
+    def unk_id(self) -> int | None:
+        return self._sym2id.get(UNK)
+
     @classmethod
     def from_corpus(cls, sequences: list[list[str]], blank: str = "<blank>") -> "Vocab":
         seen: list[str] = []
@@ -73,10 +88,17 @@ class Vocab:
                 if sym not in seen_set:
                     seen_set.add(sym)
                     seen.append(sym)
-        return cls([blank] + seen, blank=blank)
+        reserved = {blank, SOS, EOS, UNK}
+        return cls([blank, UNK] + [sym for sym in seen if sym not in reserved], blank=blank)
 
     def encode(self, symbols: list[str]) -> list[int]:
         return [self._sym2id[s] for s in symbols]
+
+    def encode_with_unk(self, symbols: list[str]) -> list[int]:
+        unk_id = self.unk_id
+        if unk_id is None:
+            raise ValueError(f"vocabulary has no {UNK} token")
+        return [self._sym2id.get(sym, unk_id) for sym in symbols]
 
     def has(self, sym: str) -> bool:
         return sym in self._sym2id

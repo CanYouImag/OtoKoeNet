@@ -4,6 +4,8 @@ import argparse
 import csv
 import json
 import math
+import os
+import random
 import time
 from pathlib import Path
 
@@ -19,17 +21,30 @@ from otokoenet.text import Vocab
 
 
 class CacheDataset(Dataset):
-    def __init__(self, manifest: Manifest) -> None:
+    def __init__(self, manifest: Manifest, specaug: SpecAugment | None = None) -> None:
         self.manifest = manifest
+        self.specaug = specaug
 
     def __len__(self) -> int:
         return len(self.manifest)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return load_entry(self.manifest[idx])
+        feat, char_ids, mora_ids = load_entry(self.manifest[idx])
+        if self.specaug is not None:
+            feat = self.specaug(feat.unsqueeze(0)).squeeze(0)
+        return feat, char_ids, mora_ids
 
 
 class EMA:
+    """权重滑动平均。
+
+    `update()` 跳过 `num_batches_tracked`（它只在 `momentum=None` 时影响归一化，
+    本项目用固定 momentum=0.1，因此不需要平均）。副作用是 `shadow` 缺少这些键，
+    所以 `apply()` 不能用 `strict=True`：那样会在每个 epoch 求 validation 时
+    直接抛 `Missing key(s) in state_dict`。这里改为 `strict=False` 并显式断言
+    缺失键只能是 `num_batches_tracked`，避免把真正的结构不匹配也一起放过去。
+    """
+
     def __init__(self, model: torch.nn.Module, decay: float) -> None:
         self.decay = decay
         self.model = model
@@ -50,7 +65,12 @@ class EMA:
     @torch.no_grad()
     def apply(self) -> None:
         self.backup = {k: v.detach().clone() for k, v in self.model.state_dict().items()}
-        self.model.load_state_dict(self.shadow)
+        inc = self.model.load_state_dict(self.shadow, strict=False)
+        bad = [k for k in inc.missing_keys if "num_batches_tracked" not in k]
+        if bad or inc.unexpected_keys:
+            raise RuntimeError(
+                f"EMA 影子权重与模型结构不匹配: missing={bad[:3]} unexpected={inc.unexpected_keys[:3]}"
+            )
 
     @torch.no_grad()
     def restore(self) -> None:
@@ -74,6 +94,27 @@ class WarmupCosine:
         for g in self.opt.param_groups:
             g["lr"] = lr
         return lr
+
+
+def _rng_state() -> dict:
+    state = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _load_rng_state(state: dict | None) -> None:
+    if not state:
+        return
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"])
+    if torch.cuda.is_available() and "cuda" in state:
+        torch.cuda.set_rng_state_all(state["cuda"])
 
 
 def _flatten(grads: list[torch.Tensor]) -> torch.Tensor:
@@ -157,11 +198,34 @@ def main() -> None:
     if device.type == "cuda":
         print(f"cuda={torch.cuda.get_device_name(0)}")
 
+    seed = int(cfg["train"].get("seed", cfg["data"].get("seed", 0)))
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    print(f"seed={seed}")
+
     cache = Path(cfg["data"]["cache_dir"])
     train_manifest = Manifest.load(str(cache / "train.json"))
+    val_manifest = Manifest.load(str(cache / "val.json"))
     test_manifest = Manifest.load(str(cache / "test.json"))
     char_vocab = Vocab.load(str(cache / "char_vocab.json"))
     mora_vocab = Vocab.load(str(cache / "mora_vocab.json"))
+    train_utts = {e["utt"] for e in train_manifest.entries}
+    for split_name, split_manifest in (("val", val_manifest), ("test", test_manifest)):
+        if len(split_manifest) == 0:
+            raise RuntimeError(f"{split_name} split is empty; re-run scripts/prepare.py")
+        overlap = train_utts & {e["utt"] for e in split_manifest.entries}
+        if overlap:
+            raise RuntimeError(
+                f"{split_name} split overlaps train on {len(overlap)} utterances; refusing to train"
+            )
+    print(
+        f"split train={len(train_manifest)} val={len(val_manifest)} test={len(test_manifest)}"
+    )
 
     model = build_model(cfg, char_vocab, mora_vocab).to(device)
     print(f"params={sum(p.numel() for p in model.parameters())/1e6:.2f}M")
@@ -188,41 +252,99 @@ def main() -> None:
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=tcfg["lr"], weight_decay=tcfg.get("weight_decay", 0.01)
     )
-    total_steps = int(len(train_manifest) // tcfg["batch_size"] * tcfg["num_epochs"])
+    steps_per_epoch = (len(train_manifest) + tcfg["batch_size"] - 1) // tcfg["batch_size"]
+    total_steps = steps_per_epoch * tcfg["num_epochs"]
     sched = WarmupCosine(optimizer, tcfg.get("warmup_steps", 1000), total_steps, tcfg["lr"])
     ema = EMA(model, tcfg.get("ema_decay", 0.999))
-    specaug = SpecAugment() if tcfg.get("specaug", True) else None
+    sa = tcfg.get("specaug", {})
+    if sa is True:
+        specaug = SpecAugment()
+    elif isinstance(sa, dict):
+        specaug = SpecAugment(
+            n_time_masks=sa.get("n_time_masks", 2),
+            max_time_width=sa.get("max_time_width", 30),
+            n_freq_masks=sa.get("n_freq_masks", 1),
+            max_freq_width=sa.get("max_freq_width", 27),
+        )
+    else:
+        specaug = None
 
     start_step = 0
     start_epoch = 1
+    start_batch = 0
     ckpt_path = args.resume
-    if ckpt_path is None and not args.fresh and (save_dir / "last.pt").exists():
-        ckpt_path = str(save_dir / "last.pt")
-        print(f"auto-resume: 未指定 --resume，检测到已有断点 {ckpt_path}")
+    if ckpt_path is None and not args.fresh:
+        cands = sorted(save_dir.glob("last*.pt"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if cands:
+            print(f"auto-resume: 检测到已有断点 {cands[0].name}")
+        for cand in cands:
+            try:
+                ckpt = torch.load(cand, map_location="cpu", weights_only=False)
+                ckpt_path = str(cand)
+                break
+            except Exception as e:
+                print(f"  [!] checkpoint {cand.name} 损坏，尝试更早快照: {e}")
+    best_val = float("inf")
     if ckpt_path:
-        ckpt = torch.load(ckpt_path, map_location="cpu")
-        model.load_state_dict(ckpt["model"])
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        try:
+            model.load_state_dict(ckpt["model"], strict=True)
+        except RuntimeError as e:
+            raise RuntimeError(
+                f"checkpoint {ckpt_path} 与当前模型不匹配；请检查 config 或使用 --fresh 重新训练 ({e})"
+            ) from e
         optimizer.load_state_dict(ckpt["optimizer"])
-        ema.shadow = ckpt["ema"]
-        start_step = ckpt["step"]
-        start_epoch = ckpt.get("epoch", 1)
-        print(f"resumed from {ckpt_path} step={start_step} epoch={start_epoch}")
+        missing_ema = [
+            k
+            for k in model.state_dict()
+            if "num_batches_tracked" not in k and k not in ckpt["ema"]
+        ]
+        if missing_ema:
+            raise RuntimeError(f"checkpoint {ckpt_path} 的 EMA 权重不完整: {missing_ema[:3]}")
+        ema.shadow = {k: v.to(device) for k, v in ckpt["ema"].items()}
+        start_step = int(ckpt["step"])
+        start_epoch = int(ckpt.get("epoch", 1))
+        start_batch = int(ckpt.get("batch_in_epoch", 0))
+        best_val = float(ckpt.get("best", float("inf")))
+        _load_rng_state(ckpt.get("rng"))
+        print(
+            f"resumed from {ckpt_path} step={start_step} epoch={start_epoch} "
+            f"batch={start_batch} best={best_val:.4f}"
+        )
 
-    train_ds = CacheDataset(train_manifest)
+    train_ds = CacheDataset(train_manifest, specaug=specaug)
+    val_ds = CacheDataset(val_manifest)
     test_ds = CacheDataset(test_manifest)
-    lengths = [int(np.load(e["feat"]).shape[0]) for e in train_manifest.entries]
+    train_lengths = [int(np.load(e["feat"]).shape[0]) for e in train_manifest.entries]
+    val_lengths = [int(np.load(e["feat"]).shape[0]) for e in val_manifest.entries]
+    test_lengths = [int(np.load(e["feat"]).shape[0]) for e in test_manifest.entries]
+    data_seed = int(cfg["data"].get("seed", 0))
 
-    train_loader = DataLoader(
-        train_ds,
-        batch_sampler=BucketedBatchSampler(lengths, tcfg["batch_size"], seed=cfg["data"]["seed"]),
+    train_sampler = BucketedBatchSampler(train_lengths, tcfg["batch_size"], seed=data_seed)
+    train_collate = CollateFn(speed_perturb=tcfg.get("speed_perturb", False))
+    # DataLoader draws a worker base seed from the global torch RNG on every iter().
+    # Route that draw to a private generator so the global RNG stream stays a pure
+    # function of the training steps -- otherwise resuming mid-epoch shifts the
+    # dropout stream by one draw and the trajectory stops being reproducible.
+    loader_gen = torch.Generator()
+    loader_gen.manual_seed(data_seed + 1)
+    val_loader = DataLoader(
+        val_ds,
+        batch_sampler=BucketedBatchSampler(val_lengths, tcfg["batch_size"], shuffle=False),
         collate_fn=CollateFn(),
+        generator=loader_gen,
     )
-    test_loader = DataLoader(test_ds, batch_size=tcfg["batch_size"], collate_fn=CollateFn())
+    test_loader = DataLoader(
+        test_ds,
+        batch_sampler=BucketedBatchSampler(test_lengths, tcfg["batch_size"], shuffle=False),
+        collate_fn=CollateFn(),
+        generator=loader_gen,
+    )
+    lexicon = build_lexicon(train_manifest)
 
     w_char = tcfg.get("ctc_weight_char", 0.3)
     w_mora = tcfg.get("ctc_weight_mora", 0.3)
     track_metric = tcfg.get("track_metric", "cer_ctc")
-    best_val = float("inf")
     step = start_step
     grad_analysis = tcfg.get("grad_analysis", False)
     grad_analysis_interval = max(1, tcfg.get("grad_analysis_interval", 10))
@@ -237,37 +359,69 @@ def main() -> None:
             f"grad_analysis={grad_analysis} grad_pcgrad={grad_pcgrad} "
             f"trunk={len(trunk)} other={len(other_ps)} gate={len(gate_ps)}"
         )
-    log_f = open(save_dir / "log.csv", "a", newline="", encoding="utf-8")
+    log_path = save_dir / "log.csv"
+    need_header = not log_path.exists() or log_path.stat().st_size == 0
+    log_f = open(log_path, "a", newline="", encoding="utf-8")
     writer = csv.writer(log_f)
-    if start_step == 0:
-        writer.writerow(["step", "loss", "lr", "cer_ctc", "mer"])
+    header = ["step", "epoch", "loss", "lr", "val_cer_ctc", "val_cer_fst", "val_mer"]
+    if need_header:
+        writer.writerow(header)
     ckpt_interval = max(1, tcfg.get("ckpt_interval", 500))
+    lr = optimizer.param_groups[0]["lr"]
 
-    def save_ckpt(path: Path, epoch: int, step: int) -> None:
-        torch.save(
-            {
-                "model": model.state_dict(),
-                "ema": ema.shadow,
-                "optimizer": optimizer.state_dict(),
-                "step": step,
-                "epoch": epoch,
-                "config": cfg,
-            },
-            path,
+    def save_ckpt(path: Path, epoch: int, step: int, batch_in_epoch: int = 0, snap: bool = False) -> None:
+        payload = {
+            "model": model.state_dict(),
+            "ema": ema.shadow,
+            "optimizer": optimizer.state_dict(),
+            "step": step,
+            "epoch": epoch,
+            "batch_in_epoch": batch_in_epoch,
+            "best": best_val,
+            "rng": _rng_state(),
+            "config": cfg,
+        }
+        tmp = save_dir / f".{path.name}.tmp"
+        torch.save(payload, tmp)
+        os.replace(tmp, path)
+        if snap and path.name == "last.pt":
+            snap_path = save_dir / f"last_step{step}.pt"
+            try:
+                if snap_path.exists():
+                    snap_path.unlink()
+                os.link(path, snap_path)
+            except OSError:
+                pass
+            _prune_snaps(save_dir, keep=3)
+        print(
+            f"  saved {path.name} step={step} epoch={epoch} batch={batch_in_epoch}", flush=True
         )
-        print(f"  saved {path.name} step={step} epoch={epoch}", flush=True)
+
+    def _prune_snaps(dir_: Path, keep: int) -> None:
+        snaps = sorted(
+            dir_.glob("last_step*.pt"), key=lambda p: int(p.stem[len("last_step") :])
+        )
+        for old in snaps[:-keep]:
+            old.unlink(missing_ok=True)
 
     for epoch in range(start_epoch, tcfg["num_epochs"] + 1):
+        train_sampler.set_epoch(epoch)
+        epoch_batches = list(train_sampler)
+        offset = start_batch if epoch == start_epoch else 0
+        if offset:
+            epoch_batches = epoch_batches[offset:]
+        train_loader = DataLoader(
+            train_ds, batch_sampler=epoch_batches, collate_fn=train_collate, generator=loader_gen
+        )
         model.train()
         epoch_loss = 0.0
         n_batch = 0
         t0 = time.time()
-        for batch in train_loader:
+        for bi, batch in enumerate(train_loader):
             feat_pad, feat_len, char_pad, char_len, mora_pad, mora_len = [
                 t.to(device) for t in batch
             ]
-            if specaug is not None:
-                feat_pad = specaug(feat_pad)
+            lr = sched.step(step)
             gate_w = None
             out = model(feat_pad, feat_len)
             char_logits, mora_logits, out_len = out[:3]
@@ -338,42 +492,95 @@ def main() -> None:
             else:
                 ga_str = ""
                 loss.backward()
+            if not torch.isfinite(loss):
+                print(f"[{step + 1}] [!] non-finite loss, batch skipped")
+                optimizer.zero_grad(set_to_none=True)
+                step += 1
+                continue
             torch.nn.utils.clip_grad_norm_(model.parameters(), tcfg.get("grad_clip", 5.0))
             optimizer.step()
             ema.update()
             step += 1
-            sched.step(step)
             if step % ckpt_interval == 0:
-                save_ckpt(save_dir / "last.pt", epoch, step)
+                save_ckpt(
+                    save_dir / "last.pt",
+                    epoch,
+                    step,
+                    batch_in_epoch=bi + offset + 1,
+                    snap=(step % 600 == 0),
+                )
             epoch_loss += loss.item()
             n_batch += 1
             if step % tcfg["log_interval"] == 0:
                 gw = f" gw={gate_w[:, 0].mean().item():.3f}" if gate_w is not None else ""
-                print(
-                    f"[{step}] loss={loss.item():.3f} "
-                    f"lr={optimizer.param_groups[0]['lr']:.2e}{gw}{ga_str}"
-                )
+                print(f"[{step}] loss={loss.item():.3f} lr={lr:.2e}{gw}{ga_str}")
         avg = epoch_loss / max(1, n_batch)
-        print(f"epoch={epoch} avg_loss={avg:.3f} time={time.time()-t0:.1f}s")
+        print(
+            f"epoch={epoch} avg_loss={avg:.3f} batches={n_batch}/{steps_per_epoch} "
+            f"time={time.time()-t0:.1f}s"
+        )
 
         ema.apply()
-        lexicon = build_lexicon(train_manifest, test_manifest)
-        metrics = evaluate(model, test_loader, lexicon)
+        val_metrics = evaluate(model, val_loader, lexicon)
         ema.restore()
         print(
-            f"  eval ctc_cer={metrics['cer_ctc']*100:.2f}% "
-            f"fst_cer={metrics['cer_fst']*100:.2f}% mer={metrics['mer']*100:.2f}%"
+            f"  val ctc_cer={val_metrics['cer_ctc']*100:.2f}% "
+            f"fst_cer={val_metrics['cer_fst']*100:.2f}% mer={val_metrics['mer']*100:.2f}%"
         )
-        writer.writerow([step, f"{avg:.4f}", f"{optimizer.param_groups[0]['lr']:.2e}", f"{metrics['cer_ctc']:.4f}", f"{metrics['mer']:.4f}"])
+        writer.writerow(
+            [
+                step,
+                epoch,
+                f"{avg:.4f}",
+                f"{lr:.2e}",
+                f"{val_metrics['cer_ctc']:.4f}",
+                f"{val_metrics['cer_fst']:.4f}",
+                f"{val_metrics['mer']:.4f}",
+            ]
+        )
         log_f.flush()
 
-        if metrics[track_metric] < best_val:
-            best_val = metrics[track_metric]
+        if val_metrics[track_metric] < best_val:
+            best_val = val_metrics[track_metric]
             save_ckpt(save_dir / "best.pt", epoch, step)
-            print(f"  best {track_metric}={best_val*100:.2f}%")
+            print(f"  best val {track_metric}={best_val*100:.2f}%")
 
-        save_ckpt(save_dir / "last.pt", epoch, step)
+        save_ckpt(save_dir / "last.pt", epoch + 1, step)
+        start_batch = 0
+
     log_f.close()
+
+    report = {
+        "config": args.config,
+        "cache_dir": str(cache),
+        "train": len(train_manifest),
+        "val": len(val_manifest),
+        "test": len(test_manifest),
+        "final_step": step,
+        "epochs": tcfg["num_epochs"],
+        "best_val": best_val,
+        "track_metric": track_metric,
+    }
+    best_path = save_dir / "best.pt"
+    if best_path.exists():
+        try:
+            best_ck = torch.load(best_path, map_location="cpu", weights_only=False)
+            incompat = model.load_state_dict(best_ck["ema"], strict=False)
+            bad = [k for k in incompat.missing_keys if "num_batches_tracked" not in k]
+            if bad:
+                raise RuntimeError(f"best.pt EMA 权重不完整: {bad[:3]}")
+            test_metrics = evaluate(model, test_loader, lexicon)
+            print(
+                f"  test ctc_cer={test_metrics['cer_ctc']*100:.2f}% "
+                f"fst_cer={test_metrics['cer_fst']*100:.2f}% mer={test_metrics['mer']*100:.2f}%"
+            )
+            report["best_step"] = best_ck["step"]
+            report["best_epoch"] = best_ck["epoch"]
+            report["test"] = test_metrics
+        except Exception as e:
+            print(f"  [!] final test evaluation failed: {e}")
+    with open(save_dir / "eval_report.json", "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
     print("done")
 
 

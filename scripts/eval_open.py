@@ -60,7 +60,7 @@ def main() -> None:
     model.eval()
 
     test_manifest = Manifest.load(str(cache / "test.json"))
-    lexicon = build_lexicon(Manifest.load(str(cache / "train.json")), test_manifest)
+    lexicon = build_lexicon(Manifest.load(str(cache / "train.json")))
     converter = Kana2Kanji(Path(args.table))
     kks = pykakasi.kakasi()
     sample_rate = cfg["audio"]["sample_rate"]
