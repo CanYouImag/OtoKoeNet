@@ -96,8 +96,22 @@ def cmvn_reproduces(
     return bool(np.abs(apply_cmvn(raw, mean, std) - cached).max() <= tol)
 
 
+def resolve_wav_dir(wav_dir: "Path | dict[str, Path]", utt: str) -> Path | None:
+    """按 utt 定位 wav 目录。
+
+    单子集时传 `Path`；全语料时传 `{subset: Path}`，这里逐个子集找存在的文件。
+    找不到返回 None（调用方据此跳过该句，而不是静默当成单目录）。
+    """
+    if isinstance(wav_dir, dict):
+        for d in wav_dir.values():
+            if (d / f"{utt}.wav").exists():
+                return d
+        return None
+    return wav_dir
+
+
 def cache_cmvn_is_baked(
-    cache_dir: Path, wav_dir: Path, n_mels: int, sample_rate: int, n_utt: int = 3
+    cache_dir: Path, wav_dir: "Path | dict[str, Path]", n_mels: int, sample_rate: int, n_utt: int = 3
 ) -> bool | None:
     """探测某个特征 cache 的 `<utt>.npy` 是否已烘焙它自己的 `mean.npy`/`std.npy`。
 
@@ -107,6 +121,7 @@ def cache_cmvn_is_baked(
         None  无法判定（缺 mean/std、缺 wav 或形状不一致）
 
     用于阻止 `scripts/prepare.py` 的复用路径把「已归一化」的特征再归一化一次。
+    `wav_dir` 可以是单个目录，也可以是 `{subset: dir}`（多子集语料）。
     """
     mean_path, std_path = cache_dir / "mean.npy", cache_dir / "std.npy"
     if not (mean_path.exists() and std_path.exists()):
@@ -117,7 +132,10 @@ def cache_cmvn_is_baked(
     for path in sorted(cache_dir.glob("*.npy")):
         if path.name in ("mean.npy", "std.npy"):
             continue
-        wav = wav_dir / f"{path.stem}.wav"
+        sub_dir = resolve_wav_dir(wav_dir, path.stem)
+        if sub_dir is None:
+            continue
+        wav = sub_dir / f"{path.stem}.wav"
         if not wav.exists():
             continue
         cached = np.load(path)
@@ -199,9 +217,33 @@ def speed_perturb_feature(feat: torch.Tensor, factor: float) -> torch.Tensor:
 
 
 class CollateFn:
-    def __init__(self, speed_perturb: bool = False, speed_factors: tuple[float, ...] = (0.9, 1.0, 1.1)):
+    def __init__(
+        self,
+        speed_perturb: bool = False,
+        speed_factors: tuple[float, ...] = (0.9, 1.0, 1.1),
+        noise_prob: float = 0.0,
+        noise_snr_db: tuple[float, float] = (5.0, 20.0),
+    ):
         self.speed_perturb = speed_perturb
         self.speed_factors = speed_factors
+        self.noise_prob = noise_prob
+        self.noise_snr_db = noise_snr_db
+
+    def _add_noise(self, feat: torch.Tensor) -> torch.Tensor:
+        """特征域加性噪声（SNR 在 noise_snr_db 内均匀采样）。
+
+        **局限要说清**：这是「MUSAN + RIR」的低成本代理，不是等价物。训练走的是
+        `prepare.py` **预先烘焙**的缓存特征（`CacheDataset` 只读 `<utt>.npy`），
+        没有波形可混，所以真实的加性噪声与混响必须改 `prepare.py` 重烘焙缓存才能在
+        波形级实现。特征域高斯噪声只能模拟「谱观测被扰动」，不能模拟 RIR 的卷积畸变
+        与噪声的谱形状；后者才是域外录音的主要难点。
+        """
+        if self.noise_prob <= 0 or random.random() >= self.noise_prob:
+            return feat
+        lo, hi = self.noise_snr_db
+        snr = random.uniform(lo, hi)
+        scale = float(feat.std()) / (10.0 ** (snr / 20.0))
+        return feat + torch.randn_like(feat) * scale
 
     def __call__(self, batch: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]):
         feats, chars, moras = zip(*batch)
@@ -210,6 +252,8 @@ class CollateFn:
                 speed_perturb_feature(f, random.choice(self.speed_factors)) if self.speed_factors else f
                 for f in feats
             ]
+        if self.noise_prob > 0:
+            feats = [self._add_noise(f) for f in feats]
         T = max(f.size(0) for f in feats)
         C = feats[0].size(1)
         feat_pad = torch.zeros(len(feats), T, C)

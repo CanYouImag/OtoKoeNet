@@ -7,7 +7,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
 from sqlalchemy.orm import Session
 
-from otokoenet.align import AlignmentError
+from otokoenet.align import AlignmentError, suspect_long_vowels
 
 from app.bank import text_to_mora
 from app.config import settings
@@ -79,12 +79,17 @@ def evaluate(
         ) from e
     duration = time.perf_counter() - t0
 
+    # 長音规则：标定后的默认工作点（rel<1.0, score<0.5×句内中位数），只加标志、
+    # 不改分数（正类标签不是学习者真值，见 schemas.MoraScore.suspect_long_vowel）。
+    suspect = set(suspect_long_vowels(morae, aln))
+
     details = [
         MoraScore(
             phoneme=m,
             score=round(s * 100, 1),
             color=_color(s),
             index=i,
+            suspect_long_vowel=i in suspect,
             # start/end 是 Viterbi 路径上该 token 的帧区间。训到收敛的模型逐帧过度
             # 自信，Viterbi 几乎只给每个 token 1 帧，所以这两个值只表示「最可能的那
             # 几毫秒在哪」，宽度不携带时长信息。

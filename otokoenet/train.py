@@ -163,7 +163,79 @@ def build_model(cfg: dict, char_vocab: Vocab, mora_vocab: Vocab) -> DualCTC:
         n_mora=len(mora_vocab),
         ctc_gate=m.get("ctc_gate", False),
         gate_min_weight=m.get("gate_min_weight", 0.05),
+        aux_ctc_layer=m.get("aux_ctc_layer", 0),
     )
+
+
+def load_pretrain_init(
+    model: DualCTC, tcfg: dict, char_vocab: Vocab, mora_vocab: Vocab
+) -> None:
+    """从旧 checkpoint warm start 权重（不恢复 optimizer/scheduler/RNG）。
+
+    全语料续训时词表会变大，两个分类头从 `(n_old, d)` 变成 `(n_new, d)`，形状不同
+    没法整体拷贝，只能按**行**前缀拷贝。行号就是词表下标，所以这只有在
+    「旧词表是新词表的前缀」时才成立——`prepare.py --vocab-from` 就是为此存在。
+    条件不成立时逐行拷贝会把权重贴到错误的符号上，而且不会报任何错，因此这里
+    必须先断言前缀关系（`pretrain_vocab_dir`），不成立就直接拒绝启动。
+    """
+    path = str(tcfg["pretrain_init"])
+    src = torch.load(path, map_location="cpu", weights_only=False)
+    src_state = src.get("ema") or src["model"]
+
+    vocab_dir = tcfg.get("pretrain_vocab_dir")
+    if vocab_dir:
+        for name, current, fname in (
+            ("char", char_vocab, "char_vocab.json"),
+            ("mora", mora_vocab, "mora_vocab.json"),
+        ):
+            old = Vocab.load(str(Path(vocab_dir) / fname))
+            n = len(old)
+            if current.symbols[:n] != old.symbols:
+                bad = next(
+                    (i for i, (a, b) in enumerate(zip(current.symbols[:n], old.symbols)) if a != b),
+                    n,
+                )
+                raise RuntimeError(
+                    f"{name} 词表不是前缀保持：下标 {bad} 处新={current.symbols[bad]!r} "
+                    f"旧={old.symbols[bad]!r}；分类头按行前缀拷贝会把权重贴错符号。"
+                    "请用 scripts/prepare.py --vocab-from "
+                    f"{vocab_dir} 重建 cache。"
+                )
+            print(f"  {name} 词表前缀保持 OK: {n} -> {len(current)}")
+
+    cur_state = model.state_dict()
+    full, prefix, skipped = 0, 0, []
+    for name, src_t in src_state.items():
+        if name not in cur_state:
+            continue
+        dst_t = cur_state[name]
+        if src_t.shape == dst_t.shape:
+            dst_t.copy_(src_t)
+            full += 1
+        elif (
+            dst_t.dim() >= 1
+            and dst_t.shape[0] > src_t.shape[0]
+            and dst_t.shape[1:] == src_t.shape[1:]
+        ):
+            # 1-D 的 bias 也要拷贝：只处理 dim>=2 会让 bias 停在随机初始化，
+            # 而 bias 是 CTC 里类先验的直接来源，留着会和新权重不自洽。
+            dst_t[: src_t.shape[0]].copy_(src_t)
+            prefix += 1
+        else:
+            skipped.append(name)
+    if skipped:
+        raise RuntimeError(
+            f"pretrain_init 有 {len(skipped)} 个参数形状不兼容却没被拷贝："
+            f"{skipped[:5]}；warm start 会留下随机初始化的模块。"
+            "确认模型结构与 checkpoint 是否一致。"
+        )
+    print(
+        f"pretrain_init {path}: 全量拷贝 {full} 个张量，"
+        f"按行前缀拷贝 {prefix} 个（新增的词表行保持随机初始化）"
+    )
+    missing = [k for k in cur_state if k not in src_state]
+    if missing:
+        print(f"  [!] 源 checkpoint 缺少 {len(missing)} 个参数（保持随机初始化）: {missing[:5]}")
 
 
 def main() -> None:
@@ -233,21 +305,7 @@ def main() -> None:
     tcfg = cfg["train"]
 
     if tcfg.get("pretrain_init"):
-        src = torch.load(tcfg["pretrain_init"], map_location="cpu", weights_only=False)
-        src_state = src.get("ema") or src["model"]
-        cur_state = model.state_dict()
-        copied = 0
-        for name, src_t in src_state.items():
-            if name not in cur_state:
-                continue
-            dst_t = cur_state[name]
-            if src_t.shape == dst_t.shape:
-                dst_t.copy_(src_t)
-                copied += 1
-            elif dst_t.dim() >= 2 and dst_t.shape[0] > src_t.shape[0] and dst_t.shape[1:] == src_t.shape[1:]:
-                dst_t[: src_t.shape[0]].copy_(src_t)
-                copied += 1
-        print(f"pretrain_init copied {copied} tensors from {tcfg['pretrain_init']}")
+        load_pretrain_init(model, tcfg, char_vocab, mora_vocab)
 
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=tcfg["lr"], weight_decay=tcfg.get("weight_decay", 0.01)
@@ -321,7 +379,11 @@ def main() -> None:
     data_seed = int(cfg["data"].get("seed", 0))
 
     train_sampler = BucketedBatchSampler(train_lengths, tcfg["batch_size"], seed=data_seed)
-    train_collate = CollateFn(speed_perturb=tcfg.get("speed_perturb", False))
+    train_collate = CollateFn(
+        speed_perturb=tcfg.get("speed_perturb", False),
+        noise_prob=tcfg.get("noise_prob", 0.0),
+        noise_snr_db=tuple(tcfg.get("noise_snr_db", (5.0, 20.0))),
+    )
     # DataLoader draws a worker base seed from the global torch RNG on every iter().
     # Route that draw to a private generator so the global RNG stream stays a pure
     # function of the training steps -- otherwise resuming mid-epoch shifts the
@@ -344,6 +406,10 @@ def main() -> None:
 
     w_char = tcfg.get("ctc_weight_char", 0.3)
     w_mora = tcfg.get("ctc_weight_mora", 0.3)
+    w_aux = tcfg.get("ctc_weight_aux_mora", 0.0)
+    # aux 头是随机初始化的（warm start 时不拷贝），初始 aux CTC≈17，若一上来就按
+    # w_aux 全额反传，会用随机梯度冲击已经收敛的 encoder。线性 warmup 到 w_aux。
+    aux_warmup_steps = max(0, int(tcfg.get("aux_warmup_steps", 1000)))
     track_metric = tcfg.get("track_metric", "cer_ctc")
     step = start_step
     grad_analysis = tcfg.get("grad_analysis", False)
@@ -464,6 +530,22 @@ def main() -> None:
                     zero_infinity=True,
                 )
                 loss = w_char * ctc_char + w_mora * ctc_mora
+            if model.aux_ctc_layer and w_aux > 0:
+                # 中间层辅助 mora CTC：同一目标、更短的反传路径。out 布局见
+                # DualCTC.forward（gate 在前，aux 恒在末尾）。
+                w_aux_eff = w_aux
+                if aux_warmup_steps > 0:
+                    w_aux_eff = w_aux * min(1.0, (step + 1) / aux_warmup_steps)
+                aux_logits = out[4] if model.ctc_gate else out[3]
+                ctc_aux = torch.nn.functional.ctc_loss(
+                    aux_logits.log_softmax(2).transpose(0, 1),
+                    mora_pad,
+                    out_len,
+                    mora_len,
+                    blank=mora_vocab.blank_id,
+                    zero_infinity=True,
+                )
+                loss = loss + w_aux_eff * ctc_aux
             do_anal = grad_analysis and (step + 1) % grad_analysis_interval == 0
             optimizer.zero_grad()
             if grad_pcgrad:

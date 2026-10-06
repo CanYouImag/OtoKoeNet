@@ -11,10 +11,12 @@ if str(REPO_ROOT) not in sys.path:
 
 class Settings:
     repo_root: Path = REPO_ROOT
-    # 默认指向阶段 1–4 修复后的干净基线（val 选模、train-only 词表/句库/CMVN）。
-    # 旧值 data/cache/basic5000 + runs/basic5000_opt 属于修复前协议，不得用于验收。
-    cache_dir: Path = REPO_ROOT / "data" / "cache" / "basic5000_v2"
-    ckpt_path: Path = REPO_ROOT / "runs" / "basic5000_stage05a" / "best.pt"
+    # 生产默认 = 阶段 14（JSUT 全语料 40 epoch，val/test 选模，train-only 词表/句库/CMVN）。
+    # 指纹：ckpt_step=27249, n_char=2701, n_mora=189, 7 个文件 sha 见
+    # log/README.md §3「当前基线」。切换后 /api/health 会回报这组指纹，可用 curl 核对。
+    # 旧值 basic5000_v2 / basic5000_stage05a 是阶段 1–4 的历史基线，只作对照组。
+    cache_dir: Path = REPO_ROOT / "data" / "cache" / "jsut_full_v1"
+    ckpt_path: Path = REPO_ROOT / "runs" / "jsut_full_stage14" / "best.pt"
     upload_dir: Path = REPO_ROOT / "data" / "uploads"
     sample_rate: int = 16000
     n_mels: int = 80
@@ -28,8 +30,11 @@ class Settings:
     score_yellow: float = 0.45
 
     # 解码配置。lm_weight/beam_size 取自阶段 5A 在 **validation** 上的扫描结果
-    # （log/stage05a_acceptance.log: beam=24, lm_weight=0.2 → mora MER 6.40%）。
-    # 旧默认 lm_weight=1.0 在 val 上把 mora MER 恶化到 12.66%，不得再作为默认值。
+    # （log/stage05a_acceptance.log: beam=24, lm_weight=0.2 → mora MER 6.40%），
+    # 阶段 14 在自己的 val 上复核一致（beam=24, lm=0.2 → mora MER 6.67%，见
+    # log/stage16_eval5a_val.log）。旧默认 lm_weight=1.0 在 val 上把 mora MER
+    # 恶化到 12.66%，不得再作为默认值；lm 在本数据上的全部可用增益只有
+    # +0.03pp（6.70% → 6.67%），LM 不是瓶颈，不要再花时间重建 n-gram LM。
     decoder: str = "beam"             # greedy | beam
     beam_size: int = 24
     lm_order: int = 4
@@ -44,6 +49,10 @@ class Settings:
     # 整句平均 log 概率下界：低于此值判为「与参考文本明显不符」，显式拒绝而非返回 0 分。
     # -3.0 来自 stage 10 在 val 的实测间隔：真实录音最差 -1.84，配错文本最好 -5.91，
     # 取对数中点 -3.3 并偏向宽松侧，避免把「学得好但读得不流利」误判成读错。
+    # 阶段 14 复核（log/stage14_engine_e2e.json）：test 正确句最高 -0.0056、
+    # test 配错句最高 -0.2795，-3.0 仍然成立；但域外 probe 上正确句最低到
+    # -0.0100、配错句最高到 -0.0008，两侧已经压到同一数量级，阈值在域外
+    # 基本失效（probe 98 个 SNR0dB 样本里 96 个被误判为相符）。
     min_mean_logprob: float = float(os.environ.get("OTOKOE_MIN_MEAN_LOGPROB", "-3.0"))
 
     strict_load: bool = os.environ.get("OTOKOE_STRICT_LOAD", "1") != "0"

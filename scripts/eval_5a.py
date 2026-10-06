@@ -18,6 +18,8 @@ from otokoenet.decode import (
     ctc_collapse,
     ctc_prefix_beam_search,
     edit_distance,
+    edit_ops,
+    mora_group,
     nearest_top2,
 )
 from otokoenet.kana2kanji import Kana2Kanji
@@ -145,8 +147,18 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="阶段 5A 验收指标：kana CER / mora MER / kanji CER")
     ap.add_argument("--cache-dir", default="data/cache/basic5000_v2")
     ap.add_argument("--ckpt", default="runs/basic5000_stage05a/best.pt")
-    ap.add_argument("--split", default="test", choices=["val", "test"])
-    ap.add_argument("--table", default="data/cache/basic5000_v2/kana2kanji.json")
+    ap.add_argument(
+        "--split",
+        default="test",
+        choices=["val", "test", "probe"],
+        help="probe 是域探针集（只作诊断，不能用来选模型或选解码参数）",
+    )
+    ap.add_argument(
+        "--table",
+        default="",
+        help="kana2kanji.json；留空则跟随 --cache-dir。写死路径会让换 cache 后"
+        "汉字 CER 拿另一套表算（stage14 就这样把 basic5000_v2 的表套到了 jsut_full_v1 上）",
+    )
     ap.add_argument("--lm-order", type=int, default=4)
     ap.add_argument("--beam-size", type=int, default=12)
     ap.add_argument("--batch-size", type=int, default=8)
@@ -221,7 +233,7 @@ def main() -> None:
     lm = NGramLM(order=args.lm_order).fit(
         [e["mora_ids"] for e in train_manifest.entries], vocab_size=len(mora_vocab)
     )
-    table = Path(args.table)
+    table = Path(args.table or (Path(args.cache_dir) / "kana2kanji.json"))
     converter = Kana2Kanji(table) if table.exists() else None
     if converter is None:
         print(f"[!] kana2kanji 表不存在 ({table})：kana→汉字路线与 oracle G2P CER 不可用")
@@ -230,6 +242,11 @@ def main() -> None:
     for cfgd in configs:
         st_mer, st_kana = Stat(), Stat()
         st_lex, st_conv = Stat(), Stat()
+        # open_set_cer：按「假设句是否落在 train 句库内」切分的假名 CER。
+        # 句库判据与 Engine.recognize 完全一致（nearest_top2 的 margin 规则）。
+        st_kana_known, st_kana_open = Stat(), Stat()
+        group_stat: dict[str, dict[str, int]] = {}
+        n_ins = 0
         n_known = 0
         hyps = []
         for i, lg in enumerate(logits):
@@ -248,6 +265,18 @@ def main() -> None:
             char_ids, best_d, second_d = nearest_top2(hyp_ids, lexicon)
             is_known = second_d - best_d >= 1 and best_d <= max(4, max(1, len(hyp_ids) // 4))
             n_known += int(is_known)
+            (st_kana_known if is_known else st_kana_open).add(refs[i]["kana"], hyp_kana)
+            # mora 级错误按参考侧 mora 分组归因（促音/拗音/長音单独看）
+            ref_mora = kana_to_mora(refs[i]["kana"])
+            hyp_mora = list(mora_vocab.decode(hyp_ids))
+            for sym in ref_mora:
+                g = group_stat.setdefault(mora_group(sym), {"n": 0, "sub": 0, "del": 0})
+                g["n"] += 1
+            for op, ri, _hj in edit_ops(ref_mora, hyp_mora):
+                if op == "ins":
+                    n_ins += 1
+                    continue
+                group_stat[mora_group(ref_mora[ri])][op] += 1
             hyps.append(
                 {
                     "hyp_kana": hyp_kana,
@@ -269,6 +298,23 @@ def main() -> None:
                 "kanji_cer_lexicon": st_lex.rate(),
                 "kanji_cer_converter": st_conv.rate() if converter else None,
                 "known_rate": n_known / len(manifest),
+                # 真实计算（旧实现把这个字段写死成 None，所有历史 acceptance json
+                # 里的 open_set_cer: null 都不是「没测出来」，是「根本没算」）。
+                # n=0 时写 null 而不是 Stat.rate() 的 nan：json.dump 会把 nan 写成
+                # 字面量 NaN，那是**非法 JSON**，任何严格解析器（JS JSON.parse、
+                # jq、pydantic）读 acceptance 报告都会直接报错。
+                "known_set_kana_cer": st_kana_known.rate() if st_kana_known.n else None,
+                "known_set_n": st_kana_known.n,
+                "open_set_kana_cer": st_kana_open.rate() if st_kana_open.n else None,
+                "open_set_n": st_kana_open.n,
+                "mora_error_by_group": {
+                    g: {
+                        **v,
+                        "err_rate": (v["sub"] + v["del"]) / v["n"] if v["n"] else None,
+                    }
+                    for g, v in sorted(group_stat.items())
+                },
+                "mora_insertions": n_ins,
             }
         )
         r = results[-1]
@@ -279,6 +325,18 @@ def main() -> None:
             f"kanji CER(lexicon) {st_lex.fmt():>7s}"
             + (f" | kanji CER(conv) {st_conv.fmt():>7s}" if converter else "")
             + f" | known {r['known_rate'] * 100:.1f}%"
+            + f" | known kana CER {st_kana_known.fmt() if st_kana_known.n else 'n/a':>7s}"
+            + f"(n={st_kana_known.n})"
+            + f" | open kana CER {st_kana_open.fmt() if st_kana_open.n else 'n/a':>7s}"
+            + f"(n={st_kana_open.n})"
+        )
+        print(
+            f"[{split_name}] mora 分组错误率 "
+            + " ".join(
+                f"{g} {v['err_rate'] * 100:.2f}%(n={v['n']})"
+                for g, v in r["mora_error_by_group"].items()
+            )
+            + f" | 插入 {n_ins}"
         )
 
     # char 头 greedy 假名外汉字输出（与解码配置无关，算一次）
@@ -334,6 +392,11 @@ def main() -> None:
             print(f"  hyp_conv={h['hyp_conv']}")
 
     if args.json_out:
+        # 顶层 open_set_cer 取「主配置」的真实值，不再写死 None。旧实现在这里硬编码
+        # None，导致所有 acceptance json 顶层一直是 null，而每配置的
+        # open_set_kana_cer 才是真实计算值（阶段 16 起）。sweep 时主配置=按 mora MER
+        # 选出的 best，否则=唯一配置 results[0]。
+        primary = min(results, key=lambda r: r["mora_mer"]) if args.sweep else results[0]
         payload = {
             "ckpt": args.ckpt,
             "cache_dir": args.cache_dir,
@@ -342,7 +405,10 @@ def main() -> None:
             "results": results,
             "char_head_greedy_kanji_cer": st_char.rate(),
             "oracle_g2p_cer": st_oracle.rate() if st_oracle else None,
-            "open_set_cer": None,
+            "open_set_cer": primary["open_set_kana_cer"],
+            "open_set_n": primary["open_set_n"],
+            "known_set_cer": primary["known_set_kana_cer"],
+            "known_set_n": primary["known_set_n"],
         }
         with open(args.json_out, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)

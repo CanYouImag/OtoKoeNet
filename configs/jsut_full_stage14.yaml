@@ -1,0 +1,69 @@
+# 阶段 14：JSUT 全语料（7696 句）续训
+#
+# 背景：`log/README.md` §2.1 已判定阶段 9 干净基线的瓶颈是「数据量与域」
+# （4600 句单人朗读、epoch 62–120 共 59 个 epoch 无一次刷新）。本阶段只改
+# 数据规模与词表，**模型结构、优化器、损失权重、选模指标全部不动**，用来
+# 隔离「数据量」这一个变量：
+#   - `data.cache_dir`: data/cache/basic5000_v2 -> data/cache/jsut_full_v1
+#     train 4600 -> 约 7000 句（basic5000 的 train 部分 + 其余 8 个子集）
+#   - `train.pretrain_init`: 从 `runs/basic5000_stage09/best.pt` warm start
+#     encoder 与两个分类头，不恢复 optimizer/scheduler/RNG（等价于一个新的
+#     cosine 周期）。新出现的词表行保持随机初始化。
+#   - `train.pretrain_vocab_dir`: 断言旧词表是新词表的**前缀**，否则
+#     `train.py` 拒绝启动——分类头只能按行前缀拷贝，条件不成立会把权重
+#     贴到错误符号上且不报错。
+#   - `train.num_epochs: 120 -> 40`：数据量 +54% 后每 epoch 的 step 数从 575
+#     涨到约 880，再跑 120 epoch 没有必要；40 epoch 足以看出 val 是否越过
+#     阶段 9 的 6.92%。判据是 val mora MER 连续 8 个 epoch 不刷新即判收敛。
+#   - 其余超参与 `configs/basic5000_stage09.yaml` 逐字相同（含 `lr=1e-4`），
+#     保证「同配方 + 更多数据 + warm start」是一个干净的对照实验。
+#   - `track_metric: mer` 沿用阶段 9（mora MER 是唯一 work 的那个头）。
+#
+# 划分：`prepare.py --holdout-from data/cache/basic5000_v2` 逐字复用阶段 9 的
+# 200 val / 200 test（同一批 basic5000 句子），因此 val/test 指标与阶段 9 可直接
+# 比较。另切出一个 `probe` 域探针集（来自新增子集，只作诊断，永不参与选模），
+# 用来观察 basic5000 之外的域——val/test 全是 basic5000 句子，看不到这部分。
+#
+# 设备：CPU（本机 8 核，`num_threads: 8`；阶段 9 是在 64 核机上用 12 线程）。
+data:
+  jsut_root: data/jsut_ver1.1
+  cache_dir: data/cache/jsut_full_v1
+  val_size: 200
+  test_size: 200
+  split_seed: 42
+  seed: 0
+
+audio:
+  sample_rate: 16000
+  n_mels: 80
+
+model:
+  d_model: 128
+  n_layers: 6
+  n_heads: 4
+  ffn_dim: 512
+  conv_kernel: 7
+  dropout: 0.1
+  ctc_gate: false
+
+train:
+  batch_size: 8
+  num_epochs: 40
+  lr: 0.0001
+  warmup_steps: 1000
+  weight_decay: 0.01
+  grad_clip: 5.0
+  specaug: true
+  speed_perturb: false
+  ctc_weight_char: 1.0
+  ctc_weight_mora: 0.5
+  track_metric: mer
+  grad_analysis: false
+  ema_decay: 0.999
+  seed: 1234
+  log_interval: 50
+  ckpt_interval: 500
+  num_threads: 8
+  save_dir: runs/jsut_full_stage14
+  pretrain_init: runs/basic5000_stage09/best.pt
+  pretrain_vocab_dir: data/cache/basic5000_v2

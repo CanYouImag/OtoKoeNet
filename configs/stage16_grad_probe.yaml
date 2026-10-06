@@ -1,0 +1,59 @@
+# 阶段 16 诊断配置（**不是训练实验，产物不要用**）
+#
+# 目的：验证「char 头的噪声梯度在污染 encoder」这个假设到底成不成立。
+# 优化方案把「char 两阶段解耦」排在第 2 周最高优先级，理由是 char 权重 1.0
+# 大于 mora 0.5、而 char CER 31% 远差于 mora MER 6.5%。但这是一个**推测**，
+# 不是测量结果。要花 20 epoch 去验证一个推测之前，先用仓库里已有的仪器量一下：
+#   train.py 的 `grad_analysis` 会打印共享 encoder 参数上
+#     cos   = <grad(char_loss), grad(mora_loss)> / (|g_char| |g_mora|)
+#     rnorm = |g_char| / |g_mora|
+#   cos 显著为负 = 两个目标在 encoder 上真的对抗，「解耦/PCGrad」有依据；
+#   cos ≈ 0 或为正 = 没有冲突，char CER 高只是任务本身难（oracle G2P 下限 22%），
+#   那么第 2 周该做的是别的（见 log/README.md §2.4）。
+#
+# 其它超参与 configs/jsut_full_stage14.yaml 逐字相同，并从 stage14 best.pt
+# warm start，保证量到的是**当前生产配方**下的梯度关系，而不是某个新配方。
+# num_epochs 压到 2：只需要前几百步的稳态梯度，880 步/epoch 足够。
+data:
+  jsut_root: data/jsut_ver1.1
+  cache_dir: data/cache/jsut_full_v1
+  val_size: 200
+  test_size: 200
+  split_seed: 42
+  seed: 0
+
+audio:
+  sample_rate: 16000
+  n_mels: 80
+
+model:
+  d_model: 128
+  n_layers: 6
+  n_heads: 4
+  ffn_dim: 512
+  conv_kernel: 7
+  dropout: 0.1
+  ctc_gate: false
+
+train:
+  batch_size: 8
+  num_epochs: 2
+  lr: 0.0001
+  warmup_steps: 1000
+  weight_decay: 0.01
+  grad_clip: 5.0
+  specaug: true
+  speed_perturb: false
+  ctc_weight_char: 1.0
+  ctc_weight_mora: 0.5
+  track_metric: mer
+  grad_analysis: true
+  grad_analysis_interval: 100
+  ema_decay: 0.999
+  seed: 1234
+  log_interval: 50
+  ckpt_interval: 100000
+  num_threads: 8
+  save_dir: runs/stage16_grad_probe
+  pretrain_init: runs/jsut_full_stage14/best.pt
+  pretrain_vocab_dir: data/cache/jsut_full_v1

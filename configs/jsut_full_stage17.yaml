@@ -1,0 +1,68 @@
+# 阶段 17：中间层 CTC Loss + 速度扰动（方案二.2 + 二.4 的零/低成本部分）
+#
+# 相对 `configs/jsut_full_stage14.yaml` 只改三处（模型结构只加一个**训练期**辅助头，
+# 推理路径与 stage14 完全一致）：
+#   - `model.aux_ctc_layer: 3` + `train.ctc_weight_aux_mora: 0.3`
+#     在第 3 个 ConformerBlock 之后引出一个辅助 mora CTC 头，给 mora 目标一条更短的
+#     反传路径。辅助头只在训练时使用、不进入推理 state_dict 的必需项，因此
+#     stage14 的 checkpoint 可以继续严格加载（缺 `aux_mora_head.*` 只在 warm start
+#     时打印警告并随机初始化）。
+#     背景：`log/stage16_plan_review.log` §二.2 保留该项，但指出「缓解深层收敛难」
+#     的理由没有测量支撑——本项目 stage14 的失败模式是过拟合/域，不是欠拟合。本 run
+#     的作用是**用 grad_analysis 与 val 曲线量它到底有没有用**，不是先验承诺收益。
+#   - `train.speed_perturb: true`
+#     打开仓库里已有但一直关闭的实现（`otokoenet/data.py:CollateFn`，factors
+#     0.9/1.0/1.1）。零新数据，对抗 JSUT 单一语速。
+#   - `train.pretrain_init: runs/jsut_full_stage14/best.pt`
+#     从 stage14 基线 warm start，隔离「中间层 CTC + 速度扰动」这两个变量。
+#
+# 模型结构参数（d_model/n_layers/...）与 stage14 逐字相同 → 若结果变差，不能归因于
+# 容量变化。
+data:
+  jsut_root: data/jsut_ver1.1
+  cache_dir: data/cache/jsut_full_v1
+  val_size: 200
+  test_size: 200
+  split_seed: 42
+  seed: 0
+
+audio:
+  sample_rate: 16000
+  n_mels: 80
+
+model:
+  d_model: 128
+  n_layers: 6
+  n_heads: 4
+  ffn_dim: 512
+  conv_kernel: 7
+  dropout: 0.1
+  ctc_gate: false
+  aux_ctc_layer: 3
+
+train:
+  batch_size: 8
+  num_epochs: 15
+  lr: 0.0001
+  warmup_steps: 1000
+  weight_decay: 0.01
+  grad_clip: 5.0
+  specaug: true
+  speed_perturb: true
+  ctc_weight_char: 1.0
+  ctc_weight_mora: 0.5
+  ctc_weight_aux_mora: 0.3
+  # aux 头随机初始化，w_aux 线性 warmup（见 train.py）；否则随机辅助梯度会先
+  # 冲击已收敛的 encoder。
+  aux_warmup_steps: 1000
+  track_metric: mer
+  grad_analysis: true
+  grad_analysis_interval: 50
+  ema_decay: 0.999
+  seed: 1234
+  log_interval: 50
+  ckpt_interval: 500
+  num_threads: 8
+  save_dir: runs/jsut_full_stage17
+  pretrain_init: runs/jsut_full_stage14/best.pt
+  pretrain_vocab_dir: data/cache/jsut_full_v1

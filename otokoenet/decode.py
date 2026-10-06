@@ -231,8 +231,63 @@ def edit_distance(ref: list[int], hyp: list[int]) -> int:
     for i in range(1, n + 1):
         for j in range(1, m + 1):
             cost = 0 if ref[i - 1] == hyp[j - 1] else 1
-            dp[i][j] = min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost)
+            dp[i][j] = min(dp[i - 1][j - 1] + cost, dp[i - 1][j] + 1, dp[i][j - 1] + 1)
     return dp[n][m]
+
+
+# ---------------------------------------------------------------- mora 分组
+# develop.md 要求单独看促音/拗音/長音；分组口径与 scripts/eval_pronun.py 保持一致。
+MORA_GROUPS = ("促音", "拗音", "長音", "普通音節")
+
+
+def mora_group(sym: str) -> str:
+    """mora 符号 -> 组名（促音 / 拗音 / 長音 / 普通音節，四类互斥）。
+
+    促音（っ）与長音（ー）必须分开：前者是闭音节爆破，后者要持续一个完整音节，
+    时长分布与失败模式都不同，混在一组会互相抵消。
+    """
+    if sym == "っ":
+        return "促音"
+    if sym == "ー":
+        return "長音"
+    if sym and len(sym) >= 2 and sym[-1] in "ゃゅょャュョ":
+        return "拗音"
+    return "普通音節"
+
+
+def edit_ops(ref: list[str], hyp: list[str]) -> list[tuple[str, int, int]]:
+    """token 级 Levenshtein 回溯：('sub', ref_i, hyp_j) / ('del', ref_i, -1) / ('ins', -1, hyp_j)。
+
+    存在的理由：`edit_distance` 只给一个总数，无法回答「错误出在哪个 mora 上」。
+    长音错误率是普通音節的 3 倍这种结论只有拿到归因才能下（stage 14 实测）。
+    """
+    n, m = len(ref), len(hyp)
+    d = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(n + 1):
+        d[i][0] = i
+    for j in range(m + 1):
+        d[0][j] = j
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            cost = 0 if ref[i - 1] == hyp[j - 1] else 1
+            d[i][j] = min(d[i - 1][j - 1] + cost, d[i - 1][j] + 1, d[i][j - 1] + 1)
+    ops: list[tuple[str, int, int]] = []
+    i, j = n, m
+    while i > 0 or j > 0:
+        if i > 0 and j > 0:
+            cost = 0 if ref[i - 1] == hyp[j - 1] else 1
+            if d[i][j] == d[i - 1][j - 1] + cost:
+                if cost:
+                    ops.append(("sub", i - 1, j - 1))
+                i, j = i - 1, j - 1
+                continue
+        if i > 0 and d[i][j] == d[i - 1][j] + 1:
+            ops.append(("del", i - 1, -1))
+            i -= 1
+            continue
+        ops.append(("ins", -1, j - 1))
+        j -= 1
+    return ops
 
 
 @torch.no_grad()

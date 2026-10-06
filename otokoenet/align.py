@@ -109,6 +109,53 @@ def score_alignment(log_probs: np.ndarray, target: np.ndarray, path: list[int]) 
     return scores, total
 
 
+def gop_scores(
+    log_probs: np.ndarray,
+    target: np.ndarray,
+    frames_of: list[list[int]],
+    *,
+    exclude_blank: bool = True,
+) -> list[float]:
+    """逐实例 GOP（Goodness of Pronunciation，对数后验比）。
+
+    与 `score_alignment`/`align_and_score` 里那个「目标帧上的平均后验」的区别：
+    平均后验在训到收敛的 CTC 上处处接近 1（逐帧过度自信），四舍五入后区分度有限；
+    GOP 是**相对**量，把目标与同一帧上最强的竞争项相减：
+
+        GOP(p) = mean_{t in frames(p)} [ log P(p | x_t) - log max_{q != p} P(q | x_t) ]
+
+    同一个后验，减去竞争项后，「发对了」与「发成别的音」的间隔被放大。竞争项默认
+    排除 blank（`exclude_blank=True`）：blank 在停顿帧上恒为最强项，把它算进来
+    会让 GOP 退化成「是否在发声」而不是「发的是不是这个音」。需要和 blank 比时
+    传 `exclude_blank=False`。
+
+    返回逐目标 token 的 GOP（log 单位，<=0 表示竞争项更强），未分配帧的实例给
+    一个很低的有限值。
+    """
+    log_probs = np.asarray(log_probs, dtype=np.float64)
+    n = len(target)
+    out: list[float] = []
+    for j, tok in enumerate(target):
+        tok = int(tok)
+        fr = frames_of[j]
+        if not fr:
+            out.append(_NEG / 100.0)
+            continue
+        col = log_probs[fr, tok]
+        other = np.delete(log_probs[fr], tok, axis=1)
+        if exclude_blank:
+            # blank 是列 0；other 已经删掉 target 列，若 target != blank 则 blank 仍在
+            # other 的第 0 列，再删一次。target == blank 时目标是 blank，分母没有它。
+            if tok != 0:
+                other = other[:, 1:]
+        if other.size == 0:
+            out.append(float(col.mean()))
+            continue
+        comp = other.max(axis=1)
+        out.append(float(np.mean(col - comp)))
+    return out
+
+
 @dataclass
 class MoraAlignment:
     """一次成功的逐 mora 对齐结果。
@@ -132,6 +179,8 @@ class MoraAlignment:
     frame_ms: float
     utterance_ms: float
     blank_ratio: float
+    gops: list[float] = field(default_factory=list)
+    gop_total: float = 0.0
     unaligned: list[int] = field(default_factory=list)
 
     @property
@@ -147,6 +196,8 @@ class MoraAlignment:
     def as_dict(self) -> dict:
         return {
             "scores": [round(s, 6) for s in self.scores],
+            "gops": [round(v, 6) for v in self.gops],
+            "gop_total": round(self.gop_total, 6),
             "logprobs": [round(v, 6) for v in self.logprobs],
             "spans": [list(s) for s in self.spans],
             "durations": self.durations,
@@ -397,6 +448,8 @@ def align_and_score(
     ]
     pmed = _median(post_durations)
     post_rel = [d / pmed if pmed > 0 else 0.0 for d in post_durations]
+    gops = gop_scores(log_probs, target, frames_of)
+    gop_total = float(np.mean(gops)) if gops else 0.0
     total = float(np.mean(scores))
     mean_logprob = float(np.mean(logprobs))
     if mean_logprob < min_mean_logprob:
@@ -421,4 +474,51 @@ def align_and_score(
         frame_ms=frame_ms,
         utterance_ms=T * frame_ms,
         blank_ratio=n_blank / T,
+        gops=gops,
+        gop_total=gop_total,
     )
+
+
+def suspect_long_vowels(
+    syms: list[str],
+    aln: MoraAlignment,
+    *,
+    rel_threshold: float = 1.0,
+    score_median_frac: float = 0.5,
+) -> list[int]:
+    """规则标记「疑似漏读/短读長音」的实例下标（零训练后处理）。
+
+    动机（`log/README.md` §2.4）：長音识别错误率是普通音節的 2.5~3.3 倍，
+    主要混淆是「ー」被短读成う/い。线上 `/api/evaluate` 的 `details[]` 已经
+    带 `rel_duration`（后验相对时长，已归一化）和 `score`，不需要新模型就能加规则。
+
+    规则：对参考侧每个「ー」实例，同时满足
+      1. 后验相对时长 `post_rel_durations[i] < rel_threshold`
+      2. `scores[i] < score_median_frac *` 句内分数中位数（该实例明显比同句其它
+         mora 更像发错）
+    才标记。两个条件同时要求是为了压低「说得快但正确」的误报：只说快会给
+    短时长，但分数未必低。
+
+    参数默认值来自 `scripts/eval_long_vowel.py` 的额定标定：在 val 上按
+    「正确录音误报率 <= 5%」选出的工作点是 `rel_threshold=1.0,
+    score_median_frac=0.5`，在 test/probe 上保持不变（test FPR 3.1%/召回
+    87.5%，probe FPR 1.7%/召回 75.5% —— 这里的召回是「跟随识别错误」，不是
+    「学习者漏读」，见脚本 docstring 的标签局限）。旧的 `rel<0.8, score<中位数`
+    默认规则在 val 上 FPR 30.4%，会把大量读对的長音标红，已弃用。
+
+    Returns:
+        被标记的实例下标（升序）。
+    """
+    if not aln.scores:
+        return []
+    med_score = _median(list(aln.scores))
+    flagged: list[int] = []
+    for i, sym in enumerate(syms):
+        if sym != "ー" or i >= len(aln.post_rel_durations):
+            continue
+        if (
+            aln.post_rel_durations[i] < rel_threshold
+            and aln.scores[i] < score_median_frac * med_score
+        ):
+            flagged.append(i)
+    return flagged

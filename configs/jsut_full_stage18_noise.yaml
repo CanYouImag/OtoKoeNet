@@ -1,0 +1,61 @@
+# 阶段 18：波形级噪声 + RIR 增强（方案二.4 的真版本）
+#
+# 前置（必须先跑，见 scripts/download_musan.sh）：
+#   1. bash scripts/download_musan.sh          # MUSAN 11GB + RIRS_NOISES 1.5GB → data/
+#      （本机实测 ModelScope 国内镜像可到 ~240MB/s，见 log/stage18_augment_plan.log）
+#   2. python scripts/prepare.py --jsut-root data/jsut_ver1.1 --subsets all \
+#        --cache-dir data/cache/jsut_full_noise_v1 \
+#        --holdout-from data/cache/basic5000_v2 --vocab-from data/cache/basic5000_v2 \
+#        --probe-frac 0.1 \
+#        --probe-subsets countersuffix26,loanword128,onomatopee300,precedent130,repeat500,travel1000,utparaphrase512,voiceactress100 \
+#        --noise-dir data/musan --rir-dir data/RIRS_NOISES/simulated_rirs \
+#        --noise-prob 0.3 --rir-prob 0.3 --snr-db-range 5,20
+#      - 划分参数逐字复用 jsut_full_v1（holdout basic5000_v2 / probe-frac 0.1 / 8 个 probe
+#        子集），val/test/probe 与 jsut_full_v1 完全同一批句子，指标可直接比；
+#      - 增强**只作用于 train**，val/test/probe 保持干净；CMVN 用干净 train 统计量。
+#
+# 本配置相对 stage14 只改 cache_dir / save_dir / pretrain_init 与 epoch 数：
+# 增强已经烘焙进特征缓存，训练侧不需要再开任何噪声开关（CollateFn.noise_prob 保持 0，
+# 那是特征域代理，本阶段走真波形增强）。
+data:
+  jsut_root: data/jsut_ver1.1
+  cache_dir: data/cache/jsut_full_noise_v1
+  val_size: 200
+  test_size: 200
+  split_seed: 42
+  seed: 0
+
+audio:
+  sample_rate: 16000
+  n_mels: 80
+
+model:
+  d_model: 128
+  n_layers: 6
+  n_heads: 4
+  ffn_dim: 512
+  conv_kernel: 7
+  dropout: 0.1
+  ctc_gate: false
+
+train:
+  batch_size: 8
+  num_epochs: 20
+  lr: 0.0001
+  warmup_steps: 1000
+  weight_decay: 0.01
+  grad_clip: 5.0
+  specaug: true
+  speed_perturb: false
+  ctc_weight_char: 1.0
+  ctc_weight_mora: 0.5
+  track_metric: mer
+  grad_analysis: false
+  ema_decay: 0.999
+  seed: 1234
+  log_interval: 50
+  ckpt_interval: 500
+  num_threads: 8
+  save_dir: runs/jsut_full_stage18_noise
+  pretrain_init: runs/jsut_full_stage14/best.pt
+  pretrain_vocab_dir: data/cache/jsut_full_v1

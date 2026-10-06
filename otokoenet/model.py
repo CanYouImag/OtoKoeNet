@@ -213,16 +213,28 @@ class ConformerEncoder(nn.Module):
             [ConformerBlock(d_model, n_heads, ffn_dim, conv_kernel, dropout) for _ in range(n_layers)]
         )
 
-    def forward(self, x: torch.Tensor, feat_len: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, x: torch.Tensor, feat_len: torch.Tensor, capture_layer: int = 0
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """`capture_layer=k>0` 时额外返回第 k 个 ConformerBlock 之后的输出（辅助 CTC 用）。
+
+        中间层 CTC（方案二.2）只给浅层更短的梯度通路，推理不用、不增加推理参数。
+        第 k 层之后的时间分辨率与最终输出一致，所以可以直接复用 `out_len` 做 CTC。
+        """
         feat_mask = build_padding_mask(feat_len, x.size(1))
         x = self.subsample(x, feat_mask)
         out_len = subsampled_lengths(feat_len)
         mask = build_padding_mask(out_len.clamp(min=1, max=x.size(1)), x.size(1))
         x = self.pe(x)
-        for block in self.blocks:
+        aux: torch.Tensor | None = None
+        for i, block in enumerate(self.blocks):
             x = block(x, mask)
+            if capture_layer and i == capture_layer - 1:
+                aux = x
         x = x.masked_fill(mask.unsqueeze(-1), 0.0)
-        return x, out_len
+        if aux is not None:
+            aux = aux.masked_fill(mask.unsqueeze(-1), 0.0)
+        return x, out_len, aux
 
 
 def build_padding_mask(lengths: torch.Tensor, max_len: int) -> torch.Tensor:
@@ -268,19 +280,28 @@ class DualCTC(nn.Module):
         n_mora: int,
         ctc_gate: bool = False,
         gate_min_weight: float = 0.05,
+        aux_ctc_layer: int = 0,
     ) -> None:
         super().__init__()
         self.encoder = ConformerEncoder(in_dim, d_model, n_layers, n_heads, ffn_dim, conv_kernel, dropout)
         self.char_head = nn.Linear(d_model, n_char)
         self.mora_head = nn.Linear(d_model, n_mora)
         self.ctc_gate = ctc_gate
+        self.aux_ctc_layer = int(aux_ctc_layer) if aux_ctc_layer else 0
         if ctc_gate:
             self.gate = SoftGate(d_model, gate_min_weight)
+        if self.aux_ctc_layer:
+            # 训练期辅助 mora CTC 头（推理不用、不加载）。加在中间层之后，
+            # 给 mora 目标一条更短的反传路径，缓解深层收敛慢。
+            self.aux_mora_head = nn.Linear(d_model, n_mora)
 
     def forward(self, x: torch.Tensor, feat_len: torch.Tensor):
-        enc, out_len = self.encoder(x, feat_len)
+        enc, out_len, aux = self.encoder(x, feat_len, self.aux_ctc_layer)
         char_logits = self.char_head(enc)
         mora_logits = self.mora_head(enc)
+        out: list[torch.Tensor] = [char_logits, mora_logits, out_len]
         if self.ctc_gate:
-            return char_logits, mora_logits, out_len, self.gate(enc, out_len)
-        return char_logits, mora_logits, out_len
+            out.append(self.gate(enc, out_len))
+        if self.aux_ctc_layer:
+            out.append(self.aux_mora_head(aux))
+        return tuple(out)

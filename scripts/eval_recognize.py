@@ -48,9 +48,12 @@ def main() -> None:
     ap.add_argument("--ckpt", type=str, default="runs/basic5000/best.pt")
     ap.add_argument("--table", type=str, default="data/cache/basic5000/kana2kanji.json")
     ap.add_argument("--decoder", type=str, choices=["greedy", "beam"], default="beam")
-    ap.add_argument("--beam-size", type=int, default=12)
+    # 默认值与 backend/app/config.py 的生产解码参数保持一致（阶段 5A/14 在 val 上
+    # 选出来的点）。旧默认 beam=12 + lm_weight=1.0：lm 1.0 在 val 把 mora MER
+    # 推到 12.66%，任何不带 --lm-weight 直接跑的验收数字都是坏的。
+    ap.add_argument("--beam-size", type=int, default=24)
     ap.add_argument("--lm-order", type=int, default=4)
-    ap.add_argument("--lm-weight", type=float, default=1.0)
+    ap.add_argument("--lm-weight", type=float, default=0.2)
     ap.add_argument("--length-penalty", type=float, default=0.0)
     ap.add_argument("--num-examples", type=int, default=8)
     args = ap.parse_args()

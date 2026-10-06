@@ -33,6 +33,11 @@ class MoraScore(BaseModel):
     # duration/rel_duration 为后验时长与其相对中位数的比值
     duration_ms: float = 0.0
     rel_duration: float = 1.0
+    # 長音规则（otokoenet.align.suspect_long_vowels，零训练、可直接上）：
+    # 该 mora 是「ー」、后验相对时长偏低、且分数远低于句内中位数 → 疑似漏读/短读長音。
+    # 前端可据此提示，但**不自动改分**：规则的正类标签是「模型把它听成别的音」，
+    # 不是「学习者真的发错」，真正校准需要学习者录音（见 log/stage17_plan.log §三）。
+    suspect_long_vowel: bool = False
 
 
 class EvaluateOut(BaseModel):
