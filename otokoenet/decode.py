@@ -236,7 +236,7 @@ def edit_distance(ref: list[int], hyp: list[int]) -> int:
 
 
 # ---------------------------------------------------------------- mora 分组
-# develop.md 要求单独看促音/拗音/長音；分组口径与 scripts/eval_pronun.py 保持一致。
+# README（原 develop.md）要求单独看促音/拗音/長音；分组口径与 scripts/eval_pronun.py 保持一致。
 MORA_GROUPS = ("促音", "拗音", "長音", "普通音節")
 
 

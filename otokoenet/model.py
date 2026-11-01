@@ -67,6 +67,44 @@ class Swish(nn.Module):
         return x * torch.sigmoid(x)
 
 
+class RelativePositionBias(nn.Module):
+    """T5 式可学习相对位置偏置（阶段 19，`model.rel_pos` 开关，默认关）。
+
+    作为加性 mask 注入现有 `nn.MultiheadAttention`：`score(i,j) += bias[bucket(i-j)]`。
+    相对 Transformer-XL 的 `q·R + u·K + v·R`，这里省掉内容-位置交互项与 skewing，
+    只保留**相对距离**这一项（更简单、可直接当 attn_mask 传、不改 MHA 结构），
+    用于消融「绝对正弦 PE 是否限制语速/长句泛化」。**需重训才有效，默认关。**
+    """
+
+    def __init__(self, n_heads: int, num_buckets: int = 32, max_distance: int = 128) -> None:
+        super().__init__()
+        self.n_heads = n_heads
+        self.num_buckets = num_buckets
+        self.max_distance = max_distance
+        self.emb = nn.Embedding(num_buckets, n_heads)
+
+    def _buckets(self, length: int, device) -> torch.Tensor:
+        pos = torch.arange(length, device=device)
+        rel = pos[:, None] - pos[None, :]  # (L, L)，i - j
+        sign = (rel < 0).long()
+        n = rel.abs()
+        half = self.num_buckets // 2
+        max_exact = half // 2
+        is_small = n < max_exact
+        val_large = max_exact + (
+            torch.log(n.clamp(min=1).float() / max_exact)
+            / math.log(self.max_distance / max_exact)
+            * (half - max_exact)
+        ).long()
+        val_large = val_large.clamp(max=half - 1)
+        bucket = sign * half + torch.where(is_small, n, val_large)
+        return bucket
+
+    def forward(self, length: int, device) -> torch.Tensor:
+        b = self._buckets(length, device)  # (L, L)
+        return self.emb(b).permute(2, 0, 1)  # (H, L, S)
+
+
 class FeedForward(nn.Module):
     def __init__(self, d_model: int, ffn_dim: int, dropout: float = 0.1) -> None:
         super().__init__()
@@ -176,20 +214,44 @@ class ConvModule(nn.Module):
 
 
 class ConformerBlock(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, ffn_dim: int, conv_kernel: int, dropout: float = 0.1) -> None:
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        ffn_dim: int,
+        conv_kernel: int,
+        dropout: float = 0.1,
+        rel_pos: bool = False,
+    ) -> None:
         super().__init__()
         self.ffn1 = FeedForward(d_model, ffn_dim, dropout)
         self.attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
         self.conv = ConvModule(d_model, conv_kernel, dropout)
         self.ffn2 = FeedForward(d_model, ffn_dim, dropout)
         self.norm = nn.LayerNorm(d_model)
+        self.n_heads = n_heads
+        self.rel_pos = rel_pos
+        if rel_pos:
+            self.rel_bias = RelativePositionBias(n_heads)
+
+    def _attention(self, x: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
+        if not self.rel_pos:
+            if mask is None:
+                return self.attn(x, x, x)[0]
+            return self.attn(x, x, x, key_padding_mask=mask)[0]
+        # 相对位置偏置作为加性 attn_mask；padding 折成 -inf 一起传入（不再用
+        # key_padding_mask，避免二者叠加时的形状/优先级问题）。
+        b, l, _ = x.shape
+        bias = self.rel_bias(l, x.device)  # (H, L, S)
+        add = bias.unsqueeze(0).expand(b, -1, -1, -1).reshape(b * self.n_heads, l, l)
+        if mask is not None:
+            pad = mask[:, None, None, :].expand(b, self.n_heads, 1, l)
+            add = add.masked_fill(pad.reshape(b * self.n_heads, 1, l), float("-inf"))
+        return self.attn(x, x, x, attn_mask=add)[0]
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         x = x + 0.5 * self.ffn1(x)
-        if mask is None:
-            x = x + self.attn(x, x, x)[0]
-        else:
-            x = x + self.attn(x, x, x, key_padding_mask=mask)[0]
+        x = x + self._attention(x, mask)
         x = x + self.conv(x, mask)
         x = x + 0.5 * self.ffn2(x)
         return self.norm(x)
@@ -205,21 +267,27 @@ class ConformerEncoder(nn.Module):
         ffn_dim: int,
         conv_kernel: int,
         dropout: float = 0.1,
+        rel_pos: bool = False,
     ) -> None:
         super().__init__()
         self.subsample = ConvSubsampling(in_dim, d_model, dropout)
         self.pe = PositionalEncoding(d_model)
         self.blocks = nn.ModuleList(
-            [ConformerBlock(d_model, n_heads, ffn_dim, conv_kernel, dropout) for _ in range(n_layers)]
+            [
+                ConformerBlock(d_model, n_heads, ffn_dim, conv_kernel, dropout, rel_pos=rel_pos)
+                for _ in range(n_layers)
+            ]
         )
 
     def forward(
-        self, x: torch.Tensor, feat_len: torch.Tensor, capture_layer: int = 0
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        self,
+        x: torch.Tensor,
+        feat_len: torch.Tensor,
+        capture_layer: int = 0,
+        capture_layers: tuple[int, ...] = (),
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, list[torch.Tensor]]:
         """`capture_layer=k>0` 时额外返回第 k 个 ConformerBlock 之后的输出（辅助 CTC 用）。
-
-        中间层 CTC（方案二.2）只给浅层更短的梯度通路，推理不用、不增加推理参数。
-        第 k 层之后的时间分辨率与最终输出一致，所以可以直接复用 `out_len` 做 CTC。
+        `capture_layers` 是 1-based 层号元组，收集这些层输出用于多尺度融合（阶段 19）。
         """
         feat_mask = build_padding_mask(feat_len, x.size(1))
         x = self.subsample(x, feat_mask)
@@ -227,14 +295,18 @@ class ConformerEncoder(nn.Module):
         mask = build_padding_mask(out_len.clamp(min=1, max=x.size(1)), x.size(1))
         x = self.pe(x)
         aux: torch.Tensor | None = None
+        captured: list[torch.Tensor] = []
         for i, block in enumerate(self.blocks):
             x = block(x, mask)
             if capture_layer and i == capture_layer - 1:
                 aux = x
+            if capture_layers and (i + 1) in capture_layers:
+                captured.append(x)
         x = x.masked_fill(mask.unsqueeze(-1), 0.0)
         if aux is not None:
             aux = aux.masked_fill(mask.unsqueeze(-1), 0.0)
-        return x, out_len, aux
+        captured = [c.masked_fill(mask.unsqueeze(-1), 0.0) for c in captured]
+        return x, out_len, aux, captured
 
 
 def build_padding_mask(lengths: torch.Tensor, max_len: int) -> torch.Tensor:
@@ -281,9 +353,14 @@ class DualCTC(nn.Module):
         ctc_gate: bool = False,
         gate_min_weight: float = 0.05,
         aux_ctc_layer: int = 0,
+        rel_pos: bool = False,
+        multi_scale: bool = False,
+        multi_scale_layers: tuple[int, ...] = (2, 4, 6),
     ) -> None:
         super().__init__()
-        self.encoder = ConformerEncoder(in_dim, d_model, n_layers, n_heads, ffn_dim, conv_kernel, dropout)
+        self.encoder = ConformerEncoder(
+            in_dim, d_model, n_layers, n_heads, ffn_dim, conv_kernel, dropout, rel_pos=rel_pos
+        )
         self.char_head = nn.Linear(d_model, n_char)
         self.mora_head = nn.Linear(d_model, n_mora)
         self.ctc_gate = ctc_gate
@@ -294,9 +371,26 @@ class DualCTC(nn.Module):
             # 训练期辅助 mora CTC 头（推理不用、不加载）。加在中间层之后，
             # 给 mora 目标一条更短的反传路径，缓解深层收敛慢。
             self.aux_mora_head = nn.Linear(d_model, n_mora)
+        # 多尺度 Conformer 输出融合（阶段 19，默认关）：第 2/4/6 层输出 LayerNorm 后
+        # 拼接 → Linear(k·d_model→d_model) → 双 CTC 头。**需重训**，默认关。
+        self.multi_scale = multi_scale
+        self.multi_scale_layers = tuple(multi_scale_layers) if multi_scale else ()
+        if multi_scale:
+            k = len(self.multi_scale_layers)
+            self.ms_norms = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(k)])
+            self.ms_proj = nn.Linear(k * d_model, d_model)
+
+    def _fuse(self, enc: torch.Tensor, captured: list[torch.Tensor]) -> torch.Tensor:
+        if not self.multi_scale or not captured:
+            return enc
+        merged = torch.cat([n(c) for n, c in zip(self.ms_norms, captured)], dim=-1)
+        return self.ms_proj(merged)
 
     def forward(self, x: torch.Tensor, feat_len: torch.Tensor):
-        enc, out_len, aux = self.encoder(x, feat_len, self.aux_ctc_layer)
+        enc, out_len, aux, captured = self.encoder(
+            x, feat_len, self.aux_ctc_layer, self.multi_scale_layers
+        )
+        enc = self._fuse(enc, captured)
         char_logits = self.char_head(enc)
         mora_logits = self.mora_head(enc)
         out: list[torch.Tensor] = [char_logits, mora_logits, out_len]

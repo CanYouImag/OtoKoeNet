@@ -7,7 +7,7 @@
 4. 严格加载会对「删掉一个权重张量」的坏 checkpoint 硬失败（不静默部分加载）；
 5. cache 目录与 checkpoint 训练配置错配时硬失败；
 6. 在真实 wav 上跑识别，输出非空且 kana 序列与参考 mora 解码一致；
-7. 延迟基准：featurize / encode+decode / 端到端 的 p50/p95（develop.md 要求 <3s）。
+7. 延迟基准：featurize / encode+decode / 端到端 的 p50/p95（README 要求 <3s）。
 
     python scripts/test_engine_load.py --n-utt 20
 """
@@ -168,7 +168,7 @@ def main() -> int:
         print(f"  {name:14s} p50={pct(v, 0.5) * 1000:7.1f}ms  p95={pct(v, 0.95) * 1000:7.1f}ms  "
               f"mean={statistics.mean(v) * 1000:7.1f}ms")
     p95_e2e = pct(t_e2e, 0.95)
-    check(p95_e2e < 3.0, "端到端 p95 < 3s（develop.md）", f"p95={p95_e2e * 1000:.0f}ms")
+    check(p95_e2e < 3.0, "端到端 p95 < 3s（README）", f"p95={p95_e2e * 1000:.0f}ms")
 
     print()
     if FAILS:

@@ -24,8 +24,7 @@ from otokoenet.data import (
 )
 from otokoenet.text import Vocab, kana_to_mora, normalize_kana, normalize_text
 
-# 语料根目录下的子集名。JSUT ver1.1 的官方目录名里 `onomatopee300` 是三个 e
-# （JSUT 自己的拼写），不要"修正"成 onomatopoeia，否则找不到目录。
+# 语料根目录下的子集名。
 ALL_SUBSETS = (
     "basic5000",
     "countersuffix26",

@@ -6,13 +6,15 @@ from collections import defaultdict
 from pathlib import Path
 
 import jaconv
-import pykakasi
-from sudachipy import dictionary
 
 from otokoenet.text import normalize_text
 
 
 def _read_kana(text: str) -> str:
+    # pykakasi 是**构建期**依赖（build_table），推理期只读 json，不需要它。
+    # 顶层 import 会让 backend 在缺 sudachipy/pykakasi 的部署机上直接起不来。
+    import pykakasi
+
     return "".join(c["kana"] for c in pykakasi.kakasi().convert(text))
 
 
@@ -28,6 +30,10 @@ _LM_P1 = 0.1
 
 def build_table(transcript_path: Path, out_path: Path, use_trigram: bool = True) -> None:
     """用 JSUT 语料训练假名→汉字转换表（pykakasi 假名键 + Sudachi 分词 + n-gram 语言模型）。"""
+    # 构建期依赖：只在构建转换表时需要，推理期不导入（见模块顶部说明）。
+    import pykakasi
+    from sudachipy import dictionary
+
     rows = []
     with open(transcript_path, encoding="utf-8") as f:
         for line in f:

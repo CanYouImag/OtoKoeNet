@@ -164,6 +164,9 @@ def build_model(cfg: dict, char_vocab: Vocab, mora_vocab: Vocab) -> DualCTC:
         ctc_gate=m.get("ctc_gate", False),
         gate_min_weight=m.get("gate_min_weight", 0.05),
         aux_ctc_layer=m.get("aux_ctc_layer", 0),
+        rel_pos=m.get("rel_pos", False),
+        multi_scale=m.get("multi_scale", False),
+        multi_scale_layers=tuple(m.get("multi_scale_layers", (2, 4, 6))),
     )
 
 
@@ -407,6 +410,7 @@ def main() -> None:
     w_char = tcfg.get("ctc_weight_char", 0.3)
     w_mora = tcfg.get("ctc_weight_mora", 0.3)
     w_aux = tcfg.get("ctc_weight_aux_mora", 0.0)
+    rdrop_weight = float(tcfg.get("rdrop_weight", 0.0))
     # aux 头是随机初始化的（warm start 时不拷贝），初始 aux CTC≈17，若一上来就按
     # w_aux 全额反传，会用随机梯度冲击已经收敛的 encoder。线性 warmup 到 w_aux。
     aux_warmup_steps = max(0, int(tcfg.get("aux_warmup_steps", 1000)))
@@ -546,6 +550,21 @@ def main() -> None:
                     zero_infinity=True,
                 )
                 loss = loss + w_aux_eff * ctc_aux
+            # R-Drop（阶段 19，`train.rdrop_weight`，默认 0）：同输入两次 dropout forward，
+            # 用对称 KL 拉近两次的 token 分布。需重训才有效，默认关。
+            if rdrop_weight > 0:
+                out2 = model(feat_pad, feat_len)
+                char2, mora2 = out2[0], out2[1]
+
+                def _sym_kl(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+                    pa, pb = a.log_softmax(-1), b.log_softmax(-1)
+                    k_ab = (pa.exp() * (pa - pb)).sum(-1)
+                    k_ba = (pb.exp() * (pb - pa)).sum(-1)
+                    t = a.size(1)
+                    valid = torch.arange(t, device=a.device).unsqueeze(0) < out_len.unsqueeze(1)
+                    return 0.5 * (k_ab + k_ba)[valid].mean()
+
+                loss = loss + rdrop_weight * (_sym_kl(char_logits, char2) + _sym_kl(mora_logits, mora2))
             do_anal = grad_analysis and (step + 1) % grad_analysis_interval == 0
             optimizer.zero_grad()
             if grad_pcgrad:

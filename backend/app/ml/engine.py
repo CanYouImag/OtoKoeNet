@@ -9,9 +9,15 @@ import torch
 from otokoenet.align import AlignmentError, MoraAlignment, align_and_score
 from otokoenet.data import Manifest, apply_cmvn, extract_fbank, load_wav
 from otokoenet.decode import NGramLM, build_lexicon, ctc_collapse, ctc_prefix_beam_search, nearest_top2
+from otokoenet.joint_decode import (
+    NEG,
+    char_ids as _to_char_ids,
+    ctc_log_likelihood,
+    text_to_mora_ids,
+)
 from otokoenet.kana2kanji import Kana2Kanji
 from otokoenet.model import DualCTC
-from otokoenet.text import Vocab
+from otokoenet.text import Vocab, normalize_text
 
 
 class ModelLoadError(RuntimeError):
@@ -81,6 +87,10 @@ class Engine:
             n_mora=len(self.mora_vocab),
             ctc_gate=mcfg.get("ctc_gate", False),
             gate_min_weight=mcfg.get("gate_min_weight", 0.05),
+            aux_ctc_layer=mcfg.get("aux_ctc_layer", 0),
+            rel_pos=mcfg.get("rel_pos", False),
+            multi_scale=mcfg.get("multi_scale", False),
+            multi_scale_layers=tuple(mcfg.get("multi_scale_layers", (2, 4, 6))),
         )
         state = ckpt.get("ema") or ckpt["model"]
         self.load_report = self._load_state(state, strict=getattr(settings, "strict_load", True))
@@ -100,6 +110,30 @@ class Engine:
             seqs = [e["mora_ids"] for e in self.train_manifest.entries]
             self.lm = NGramLM(order=settings.lm_order).fit(seqs, vocab_size=len(self.mora_vocab))
 
+        # Char-Mora 联合解码（阶段 19）：需要 pykakasi 给汉字候选读假名。缺依赖时
+        # 自动回退到 converter 路线，不阻塞服务启动。
+        self._kks = None
+        self._joint_ready = False
+        if getattr(settings, "joint_decode", False):
+            try:
+                import pykakasi  # noqa: F401
+
+                self._kks = pykakasi.kakasi()
+                self._joint_ready = bool(self.char_vocab) and bool(self.mora_vocab)
+            except Exception as e:  # pragma: no cover - 部署环境相关
+                print(f"[warn] joint_decode 需要 pykakasi，加载失败将回退 converter 路线: {e}")
+
+        # OOD 检测（阶段 19，默认关闭）。detector 由 scripts/train_ood.py 落盘。
+        self.ood = None
+        if getattr(settings, "ood_enabled", False):
+            from otokoenet.ood import LogisticOOD
+
+            ood_path = Path(settings.ood_detector_path)
+            if ood_path.exists():
+                self.ood = LogisticOOD.load(ood_path)
+            else:
+                print(f"[warn] OTOKOE_OOD=1 但 detector 不存在: {ood_path}")
+
         self.fingerprints = {
             "ckpt": _sha256(self.ckpt_path),
             "ckpt_step": self.ckpt_step,
@@ -115,6 +149,8 @@ class Engine:
             "beam_size": settings.beam_size,
             "lm_weight": settings.lm_weight,
             "loaded_tensors": self.load_report["loaded"],
+            "joint_decode": self._joint_ready,
+            "ood_enabled": self.ood is not None,
         }
 
     # ---------- 加载与一致性 ----------
@@ -224,7 +260,71 @@ class Engine:
         return ctc_collapse(mora_logits)
 
     def recognize(self, feat: np.ndarray) -> str:
-        _, mora_logits = self._encode(feat)
+        char_logits, mora_logits = self._encode(feat)
+        if self._joint_ready:
+            text = self._recognize_joint(char_logits, mora_logits)
+            if text:
+                return text
+        return self._recognize_baseline(char_logits, mora_logits)
+
+    def _recognize_joint(self, char_logits, mora_logits) -> str | None:
+        """Char-Mora 序列级联合解码（阶段 19）。
+
+        候选 = {mora beam → kana → converter} ∪ {char beam}，统一按
+        `char_ll + β·mora_ll + γ·lm` 排序。`char_ll`/`mora_ll` 是 CTC 前向对数似然
+        （`otokoenet.joint_decode`）。test 汉字 CER 32.02%→27.62%，probe 34.40%→26.00%。
+        """
+        cl = char_logits.detach().numpy()
+        ml = mora_logits.detach().numpy()
+        if cl.shape[0] == 0 or ml.shape[0] == 0:
+            return None
+        beta = float(getattr(self.settings, "joint_beta", 1.0))
+        gamma = float(getattr(self.settings, "joint_gamma", 0.0))
+        n_best = int(getattr(self.settings, "joint_n_best", 8))
+        char_beam = int(getattr(self.settings, "joint_char_beam", 8))
+
+        candidates: dict[str, float] = {}
+
+        def score_text(text: str) -> None:
+            text = normalize_text(text)
+            if not text:
+                return
+            cids = _to_char_ids(text, self.char_vocab)
+            mid = text_to_mora_ids(text, self.mora_vocab, self._kks)
+            s = ctc_log_likelihood(cl, cids) if cids else NEG
+            if mid:
+                s += beta * ctc_log_likelihood(ml, mid)
+                if gamma and self.lm is not None:
+                    ctx: list[int] = []
+                    for tok in mid:
+                        s += gamma * self.lm.conditional_logp(ctx, tok)
+                        ctx.append(tok)
+            if text not in candidates or s > candidates[text]:
+                candidates[text] = s
+
+        mora_cands = ctc_prefix_beam_search(
+            ml,
+            blank_id=self.mora_vocab.blank_id,
+            beam_size=self.settings.beam_size,
+            lm=self.lm if self.settings.lm_weight > 0 else None,
+            lm_weight=self.settings.lm_weight,
+            length_penalty=self.settings.length_penalty,
+            n_best=n_best,
+        )
+        for ids, _ in mora_cands:
+            kana = "".join(self.mora_vocab.decode(list(ids)))
+            score_text(self.converter.convert(kana) if self.converter is not None else kana)
+        char_cands = ctc_prefix_beam_search(
+            cl, blank_id=self.char_vocab.blank_id, beam_size=char_beam, n_best=n_best
+        )
+        for ids, _ in char_cands:
+            score_text("".join(self.char_vocab.decode(list(ids))))
+        if not candidates:
+            return None
+        return max(candidates.items(), key=lambda kv: kv[1])[0]
+
+    def _recognize_baseline(self, char_logits, mora_logits) -> str:
+        """阶段 8 起的生产回退路径：mora beam → 句库最近邻 / kana2kanji 转换。"""
         mora_ids = self.decode_mora(mora_logits)
         kana = "".join(self.mora_vocab.decode(mora_ids))
         char_ids, best_d, second_d = nearest_top2(mora_ids, self.lexicon)

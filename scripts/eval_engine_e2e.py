@@ -63,7 +63,7 @@ def mora_group(sym: str) -> str:
 def edit_ops(ref: list[str], hyp: list[str]) -> list[tuple[str, int, int]]:
     """token 级 Levenshtein 回溯，返回 ('sub'|'del', ref_i, hyp_j) / ('ins', -1, hyp_j)。
 
-    用来把识别错误归因到**参考侧**的具体 mora（develop.md 要求单独看促音/拗音/
+    用来把识别错误归因到**参考侧**的具体 mora（README 要求单独看促音/拗音/
     长音）。插入没有参考侧归属，单独统计。
     """
     n, m = len(ref), len(hyp)
@@ -254,7 +254,7 @@ def main() -> None:
             st_kanji.add(refs[i]["text"], hyp_text)
             worst.append((d_kana, refs[i]["kana"], hyp_kana))
 
-            # 识别错误归因到参考侧 mora（develop.md：促音/拗音/长音要单独看）
+            # 识别错误归因到参考侧 mora（README：促音/拗音/长音要单独看）
             ref_mora = kana_to_mora(normalize_kana(e["kana"]))
             hyp_mora = list(engine.mora_vocab.decode(hyp_ids))
             for sym in ref_mora:

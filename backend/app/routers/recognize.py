@@ -1,16 +1,10 @@
 from __future__ import annotations
 
-import time
-import uuid
-from pathlib import Path
+from fastapi import APIRouter, File, HTTPException, Request, UploadFile, status
 
-from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
-from sqlalchemy.orm import Session
+from otokoenet.data import AudioDecodeError
 
-from app.config import settings
-from app.deps import get_current_user, get_db
 from app.ml.engine import Engine
-from app.models import Record, User
 from app.routers.evaluate import _get_engine, _save_upload
 from app.schemas import RecognizeOut
 
@@ -21,26 +15,18 @@ router = APIRouter(prefix="/api", tags=["recognize"])
 def recognize(
     request: Request,
     file: UploadFile = File(...),
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
 ) -> RecognizeOut:
     engine: Engine = _get_engine(request)
     audio_path = _save_upload(file)
-    t0 = time.perf_counter()
-    feat = engine.featurize(audio_path)
-    text = engine.recognize(feat)
-    duration = time.perf_counter() - t0
-
-    db.add(
-        Record(
-            user_id=user.user_id,
-            test_type="recognize",
-            ref_text="",
-            result_text=text,
-            score=None,
-            audio_path=audio_path,
-        )
-    )
-    db.commit()
+    try:
+        try:
+            feat = engine.featurize(audio_path)
+        except AudioDecodeError as e:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, "音频无法处理：文件损坏、为空、太短或格式不受支持"
+            ) from e
+        text = engine.recognize(feat)
+    finally:
+        audio_path.unlink(missing_ok=True)
 
     return RecognizeOut(recognized_text=text)

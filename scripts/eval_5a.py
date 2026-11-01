@@ -45,6 +45,10 @@ def load_model(ckpt_path: str, cache: Path) -> tuple[DualCTC, dict, Vocab, Vocab
         n_mora=len(mora_vocab),
         ctc_gate=m.get("ctc_gate", False),
         gate_min_weight=m.get("gate_min_weight", 0.05),
+        aux_ctc_layer=m.get("aux_ctc_layer", 0),
+        rel_pos=m.get("rel_pos", False),
+        multi_scale=m.get("multi_scale", False),
+        multi_scale_layers=tuple(m.get("multi_scale_layers", (2, 4, 6))),
     )
     state = ckpt.get("ema") or ckpt["model"]
     cur = model.state_dict()

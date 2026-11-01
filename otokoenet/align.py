@@ -182,6 +182,10 @@ class MoraAlignment:
     gops: list[float] = field(default_factory=list)
     gop_total: float = 0.0
     unaligned: list[int] = field(default_factory=list)
+    # 帧级后验熵统计（阶段 19 OOD 特征）：normal 语音下后验尖锐、熵低；带噪/截断时
+    # 分布被抹平、熵升高。只作为 detector 的一个输入，不参与打分本身。
+    entropy_mean: float = 0.0
+    entropy_std: float = 0.0
 
     @property
     def frame_rate(self) -> float:
@@ -211,6 +215,8 @@ class MoraAlignment:
             "frame_ms": self.frame_ms,
             "utterance_ms": round(self.utterance_ms, 2),
             "blank_ratio": round(self.blank_ratio, 6),
+            "entropy_mean": round(self.entropy_mean, 6),
+            "entropy_std": round(self.entropy_std, 6),
             "unaligned": self.unaligned,
         }
 
@@ -452,6 +458,11 @@ def align_and_score(
     gop_total = float(np.mean(gops)) if gops else 0.0
     total = float(np.mean(scores))
     mean_logprob = float(np.mean(logprobs))
+    # 帧级后验熵：p = softmax(log_probs)，H_t = -Σ_c p log p。OOD 特征（阶段 19）。
+    probs = np.exp(log_probs)
+    ent = -(probs * np.log(probs + 1e-12)).sum(axis=1)
+    entropy_mean = float(ent.mean())
+    entropy_std = float(ent.std())
     if mean_logprob < min_mean_logprob:
         raise AlignmentError(
             REASON_LOW_SCORE,
@@ -476,6 +487,8 @@ def align_and_score(
         blank_ratio=n_blank / T,
         gops=gops,
         gop_total=gop_total,
+        entropy_mean=entropy_mean,
+        entropy_std=entropy_std,
     )
 
 

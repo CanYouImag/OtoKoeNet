@@ -382,7 +382,7 @@ def main() -> int:
     else:
         report["human"] = {
             "status": "不可验证",
-            "reason": "未提供人工评分数据（--human-scores）。develop.md 要求的相关性需项目方提供标注。",
+            "reason": "未提供人工评分数据（--human-scores）。README 要求的相关性需项目方提供标注。",
         }
 
     Path(args.out).write_text(json.dumps(report, ensure_ascii=False, indent=2))

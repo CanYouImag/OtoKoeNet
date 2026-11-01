@@ -10,6 +10,10 @@ import torch
 import torchaudio
 
 
+class AudioDecodeError(RuntimeError):
+    """音频无法解码（损坏 / 为空 / 格式不支持且无 ffmpeg 等）。"""
+
+
 def load_wav(path: str, sample_rate: int) -> torch.Tensor:
     try:
         wav, sr = sf.read(path, dtype="float32")
@@ -18,6 +22,8 @@ def load_wav(path: str, sample_rate: int) -> torch.Tensor:
     if wav.ndim > 1:
         wav = wav.mean(axis=1)
     wav_t = torch.from_numpy(wav)
+    if wav_t.numel() == 0:
+        raise AudioDecodeError(f"audio has no samples: {path}")
     if sr != sample_rate:
         wav_t = torchaudio.functional.resample(wav_t, sr, sample_rate)
     return wav_t
@@ -46,23 +52,29 @@ def _decode_ffmpeg(path: str, sample_rate: int) -> tuple[np.ndarray, int]:
     try:
         proc = subprocess.run(cmd, capture_output=True)
     except FileNotFoundError:
-        raise RuntimeError(
+        raise AudioDecodeError(
             f"cannot decode {path}: soundfile 不支持该格式且未找到 ffmpeg，请安装 ffmpeg"
         ) from None
     if proc.returncode != 0:
         err = proc.stderr.decode("utf-8", "replace")
-        raise RuntimeError(f"audio decode failed for {path}: {err}")
+        raise AudioDecodeError(f"audio decode failed for {path}: {err}")
     wav = np.frombuffer(proc.stdout, dtype=np.float32).copy()
     if wav.size == 0:
-        raise RuntimeError(f"audio decode produced no samples for {path}")
+        raise AudioDecodeError(f"audio decode produced no samples for {path}")
     return wav, sample_rate
 
 
 def extract_fbank(wav: torch.Tensor, sample_rate: int, n_mels: int) -> torch.Tensor:
+    frame_length_ms = 25.0
+    win = int(round(frame_length_ms / 1000 * sample_rate))
+    if wav.numel() < win:
+        raise AudioDecodeError(
+            f"audio too short for fbank: {wav.numel()} samples < {win} ({frame_length_ms:g}ms @ {sample_rate}Hz)"
+        )
     feat = torchaudio.compliance.kaldi.fbank(
         wav.unsqueeze(0),
         num_mel_bins=n_mels,
-        frame_length=25.0,
+        frame_length=frame_length_ms,
         frame_shift=10.0,
         sample_frequency=sample_rate,
     )

@@ -17,14 +17,8 @@ class Settings:
     # 旧值 basic5000_v2 / basic5000_stage05a 是阶段 1–4 的历史基线，只作对照组。
     cache_dir: Path = REPO_ROOT / "data" / "cache" / "jsut_full_v1"
     ckpt_path: Path = REPO_ROOT / "runs" / "jsut_full_stage14" / "best.pt"
-    upload_dir: Path = REPO_ROOT / "data" / "uploads"
     sample_rate: int = 16000
     n_mels: int = 80
-
-    db_url: str = os.environ.get("OTOKOE_DB_URL", f"sqlite:///{(REPO_ROOT / 'data' / 'app.db').as_posix()}")
-    secret_key: str = os.environ.get("OTOKOE_SECRET", "dev-secret-change-me")
-    jwt_algorithm: str = "HS256"
-    token_ttl_seconds: int = 60 * 60 * 24
 
     score_green: float = 0.75
     score_yellow: float = 0.45
@@ -40,6 +34,17 @@ class Settings:
     lm_order: int = 4
     lm_weight: float = 0.2
     length_penalty: float = 0.0
+
+    # Char-Mora 联合解码（阶段 19，零训练）。生产 recognize() 用 mora 头 beam + converter
+    # 时汉字 CER test 32.02%；把 char 头候选与 mora 头候选放进同一池、按
+    # `char_ll + β·mora_ll + γ·lm` 重排后 test 27.62% / probe 26.00%（β/γ 只在 val 上选）。
+    # 需要 pykakasi 读汉字候选的假名；缺失时自动回退到 converter 路线并打印一次警告。
+    # 旧路径保留在 recognize() 的 except 分支里，便于 OTOKOE_JOINT_DECODE=0 回退对照。
+    joint_decode: bool = os.environ.get("OTOKOE_JOINT_DECODE", "1") != "0"
+    joint_beta: float = 1.0   # mora 头对数似然权重（val 选出）
+    joint_gamma: float = 0.0  # mora n-gram LM 权重（val 选出）
+    joint_n_best: int = 8
+    joint_char_beam: int = 8
 
     # checkpoint 严格加载：任何缺失 / 形状不符 / cache 目录与 checkpoint 训练配置不符
     # 都在启动时硬失败。设 OTOKOE_ALLOW_CACHE_MISMATCH=1 可临时放行 cache 目录错配。
@@ -58,6 +63,15 @@ class Settings:
     strict_load: bool = os.environ.get("OTOKOE_STRICT_LOAD", "1") != "0"
     allow_cache_mismatch: bool = os.environ.get("OTOKOE_ALLOW_CACHE_MISMATCH", "0") == "1"
 
+    # OOD（输入不可信）检测（阶段 19）。默认 **关闭**：detector 能把 SNR0dB 假接受
+    # 98%→0%，但 probe clean 误拒会涨到 10.5%（域外正确音频被误杀），按「probe 不退化
+    # 才切换」的规矩不设为默认。用 OTOKOE_OOD=1 开启，detector 参数由
+    # scripts/train_ood.py 落盘。
+    ood_enabled: bool = os.environ.get("OTOKOE_OOD", "0") == "1"
+    ood_detector_path: str = os.environ.get(
+        "OTOKOE_OOD_DETECTOR",
+        str(REPO_ROOT / "data" / "cache" / "jsut_full_v1" / "ood_detector.json"),
+    )
+
 
 settings = Settings()
-settings.upload_dir.mkdir(parents=True, exist_ok=True)

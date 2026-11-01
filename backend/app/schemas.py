@@ -1,24 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
-
-from pydantic import BaseModel, ConfigDict, Field
-
-
-class RegisterIn(BaseModel):
-    username: str = Field(min_length=2, max_length=32)
-    password: str = Field(min_length=6, max_length=128)
-
-
-class LoginIn(BaseModel):
-    username: str
-    password: str
-
-
-class TokenOut(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
-    username: str
+from pydantic import BaseModel
 
 
 class MoraScore(BaseModel):
@@ -49,17 +31,6 @@ class EvaluateOut(BaseModel):
 
 class RecognizeOut(BaseModel):
     recognized_text: str
-
-
-class RecordOut(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
-    record_id: int
-    test_type: str
-    ref_text: str
-    result_text: str
-    score: float | None
-    created_at: datetime
 
 
 class BankItem(BaseModel):
